@@ -1,0 +1,5 @@
+{
+  "name": "StarDraft",
+  "description": "A simplified real-time strategy game clone. Harvest minerals, build an army, and defeat the AI opponent.",
+  "requestFramePermissions": []
+}
