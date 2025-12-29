@@ -1,8 +1,12 @@
+
 import { EntityType, UnitStats } from './types';
 
 export const GAME_WIDTH = 2000;
 export const GAME_HEIGHT = 2000;
 export const FPS = 60;
+export const UI_TOP_HEIGHT = 60;
+
+export const NO_RUSH_OPTIONS = [0, 150, 250, 350];
 
 export const STATS: Record<EntityType, UnitStats> = {
   [EntityType.WORKER]: {

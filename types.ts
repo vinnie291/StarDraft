@@ -1,6 +1,8 @@
+
 export enum Owner {
   PLAYER = 'PLAYER',
-  AI = 'AI',
+  AI = 'AI', // Kept for backward compatibility with single player
+  OPPONENT = 'OPPONENT', // For multiplayer
   NEUTRAL = 'NEUTRAL',
 }
 
@@ -23,6 +25,12 @@ export enum Difficulty {
     HARD = 'HARD'
 }
 
+export enum AIStrategy {
+    RUSH = 'RUSH', // Early attack, low economy
+    MACRO = 'MACRO', // High economy, late attack
+    TURTLE = 'TURTLE' // Defensive, builds bunkers
+}
+
 export interface Vector2 {
   x: number;
   y: number;
@@ -30,8 +38,9 @@ export interface Vector2 {
 
 export interface Effect {
   id: string;
-  type: 'EXPLOSION' | 'BLOOD' | 'BUILDING_EXPLOSION' | 'HEAL';
+  type: 'EXPLOSION' | 'BLOOD' | 'BUILDING_EXPLOSION' | 'HEAL' | 'BULLET' | 'HEAL_BEAM' | 'SPARK';
   position: Vector2;
+  targetPosition?: Vector2; // Added for lines like bullets and beams
   life: number;
   maxLife: number;
   scale: number;
@@ -51,7 +60,7 @@ export interface Notification {
     life: number;
 }
 
-export interface Entity {
+export interface GameEntity {
   id: string;
   type: EntityType;
   owner: Owner;
@@ -75,7 +84,7 @@ export interface Entity {
 }
 
 export interface GameState {
-  entities: Map<string, Entity>;
+  entities: Map<string, GameEntity>;
   effects: Effect[];
   markers: Marker[];
   notifications: Notification[];
@@ -83,17 +92,23 @@ export interface GameState {
   resources: {
     [Owner.PLAYER]: number;
     [Owner.AI]: number;
+    [Owner.OPPONENT]: number;
   };
   supply: {
     [Owner.PLAYER]: { used: number; max: number };
     [Owner.AI]: { used: number; max: number };
+    [Owner.OPPONENT]: { used: number; max: number };
   };
   selection: string[];
   camera: Vector2;
   victory?: Owner;
   gameTime: number;
+  noRushFrames: number; // New field
   difficulty: Difficulty;
+  aiStrategy: AIStrategy; 
   paused: boolean;
+  isMultiplayer: boolean;
+  localPlayerId?: string;
 }
 
 export interface UnitStats {
@@ -110,4 +125,20 @@ export interface UnitStats {
   supplyCost: number;
   supplyProvided: number;
   healRate?: number; // For Medics
+}
+
+// Network Types
+export type NetMessage = 
+  | { type: 'JOIN', payload: { name: string, id: string } }
+  | { type: 'WELCOME', payload: { seed: number, hostId: string } }
+  | { type: 'READY', payload: { id: string, ready: boolean } }
+  | { type: 'START_GAME', payload: { seed: number, noRushSeconds: number } }
+  | { type: 'GAME_COMMAND', payload: { action: string, data: any, owner: Owner } }
+  | { type: 'ERROR', payload: { message: string } };
+
+export interface PlayerInfo {
+    id: string;
+    name: string;
+    isReady: boolean;
+    isHost: boolean;
 }

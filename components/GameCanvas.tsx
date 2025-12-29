@@ -1,948 +1,802 @@
-import React, { useEffect, useRef } from 'react';
-import { GameState, Entity, EntityType, Owner, Vector2, Marker, Difficulty } from '../types';
-import { STATS, GAME_WIDTH, GAME_HEIGHT } from '../constants';
+
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { GameState, GameEntity, EntityType, Owner, Vector2, Marker, Difficulty, NetMessage } from '../types';
+import { STATS, GAME_WIDTH, GAME_HEIGHT, UI_TOP_HEIGHT } from '../constants';
 import { updateGame, initGame, createEntity, addNotification } from '../services/gameLogic';
 import { playSound } from '../services/audio';
+import { network } from '../services/network';
 
 interface Props {
   onGameStateUpdate: (state: GameState) => void;
-  onSelectionChange: (selected: Entity[]) => void;
+  onSelectionChange: (selected: GameEntity[]) => void;
   commandMode: string | null;
   setCommandMode: (mode: string | null) => void;
+  isMultiplayer?: boolean;
+  gameSeed?: number;
+  isHost?: boolean;
+  difficulty?: Difficulty;
+  noRushSeconds?: number;
 }
 
-export const GameCanvas: React.FC<Props> = ({ onGameStateUpdate, onSelectionChange, commandMode, setCommandMode }) => {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const gameStateRef = useRef<GameState>(initGame());
-  const requestRef = useRef<number>(0);
-  
-  // Fog of War Canvases (Offscreen)
-  const exploredCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const visionCanvasRef = useRef<HTMLCanvasElement | null>(null);
+// Generate terrain texture once
+const renderTerrain = () => {
+    const canvas = document.createElement('canvas');
+    canvas.width = GAME_WIDTH;
+    canvas.height = GAME_HEIGHT;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return canvas;
 
-  // Input State via Refs
-  const mouseDownStateRef = useRef<{ screen: Vector2, world: Vector2 } | null>(null);
-  const mousePosRef = useRef<Vector2>({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
-  
-  // Camera Controls State
-  const keysPressed = useRef<Set<string>>(new Set());
-  const isDraggingCamera = useRef(false); // Middle mouse
-  const isRightDragging = useRef(false);  // Right mouse
-  const lastDragPos = useRef<Vector2>({ x: 0, y: 0 });
-  const rightDragStart = useRef<Vector2>({ x: 0, y: 0 });
+    // 1. Base Ground
+    ctx.fillStyle = '#1c1917'; // Dark stone/dirt
+    ctx.fillRect(0, 0, GAME_WIDTH, GAME_HEIGHT);
 
-  // Initialize offscreen canvases
-  useEffect(() => {
-      const explored = document.createElement('canvas');
-      explored.width = GAME_WIDTH;
-      explored.height = GAME_HEIGHT;
-      const ctxE = explored.getContext('2d');
-      if (ctxE) {
-          ctxE.fillStyle = 'black';
-          ctxE.fillRect(0, 0, GAME_WIDTH, GAME_HEIGHT);
-      }
-      exploredCanvasRef.current = explored;
-
-      const vision = document.createElement('canvas');
-      vision.width = GAME_WIDTH;
-      vision.height = GAME_HEIGHT;
-      visionCanvasRef.current = vision;
-  }, []);
-
-  // Reset Fog on Restart
-  useEffect(() => {
-      if (gameStateRef.current.gameTime === 0 && exploredCanvasRef.current) {
-          const ctx = exploredCanvasRef.current.getContext('2d');
-          if (ctx) {
-             ctx.globalCompositeOperation = 'source-over';
-             ctx.fillStyle = 'black';
-             ctx.fillRect(0, 0, GAME_WIDTH, GAME_HEIGHT);
-          }
-      }
-  }, [gameStateRef.current.gameTime]); 
-
-  // Helper to check visibility
-  const isEntityVisible = (entity: Entity, playerUnits: Entity[]) => {
-      if (entity.owner === Owner.PLAYER) return true;
-      const stats = STATS[entity.type];
-      for (const pUnit of playerUnits) {
-          const pStats = STATS[pUnit.type];
-          const dist = Math.sqrt(Math.pow(entity.position.x - pUnit.position.x, 2) + Math.pow(entity.position.y - pUnit.position.y, 2));
-          if (dist < pStats.vision + entity.radius) return true;
-      }
-      return false;
-  };
-
-  // Command Listener
-  useEffect(() => {
-      const handleCommand = (e: Event) => {
-          const detail = (e as CustomEvent).detail;
-          
-          if (detail.action === 'RESTART') {
-              gameStateRef.current = initGame(detail.difficulty || Difficulty.MEDIUM);
-              if (exploredCanvasRef.current) {
-                  const ctx = exploredCanvasRef.current.getContext('2d');
-                  if (ctx) {
-                     ctx.globalCompositeOperation = 'source-over';
-                     ctx.fillStyle = 'black';
-                     ctx.fillRect(0, 0, GAME_WIDTH, GAME_HEIGHT);
-                  }
-              }
-              onGameStateUpdate({ ...gameStateRef.current });
-              return;
-          }
-
-          if (detail.action === 'TOGGLE_PAUSE') {
-              gameStateRef.current.paused = !gameStateRef.current.paused;
-              onGameStateUpdate({ ...gameStateRef.current }); 
-              return;
-          }
-
-          if (detail.action === 'MOVE_CAMERA') {
-              gameStateRef.current.camera = { 
-                  x: Math.max(0, Math.min(detail.x, GAME_WIDTH - window.innerWidth)), 
-                  y: Math.max(0, Math.min(detail.y, GAME_HEIGHT - window.innerHeight)) 
-              };
-              return;
-          }
-
-          if (detail.action === 'TRAIN') {
-              const ent = gameStateRef.current.entities.get(detail.id);
-              if (ent && ent.owner === Owner.PLAYER) {
-                  const stats = STATS[detail.type as EntityType];
-                  if (gameStateRef.current.resources[Owner.PLAYER] >= stats.cost) {
-                      if (!ent.trainQueue) ent.trainQueue = [];
-                      if (ent.trainQueue.length < 5) {
-                          ent.trainQueue.push(detail.type);
-                          gameStateRef.current.resources[Owner.PLAYER] -= stats.cost;
-                          playSound('train');
-                      } else {
-                          playSound('error');
-                      }
-                  } else {
-                      addNotification(gameStateRef.current, "Not Enough Minerals!");
-                      playSound('error');
-                  }
-              }
-          }
-          
-          if (detail.action === 'UNLOAD_ALL') {
-              const ent = gameStateRef.current.entities.get(detail.id);
-              if (ent && ent.type === EntityType.BUNKER && ent.garrison) {
-                  ent.garrison.forEach(unitId => {
-                      const unit = gameStateRef.current.entities.get(unitId);
-                      if (unit) {
-                          unit.state = 'IDLE';
-                          unit.containerId = null;
-                          // Spawn around bunker
-                          const angle = Math.random() * Math.PI * 2;
-                          unit.position = {
-                              x: ent.position.x + Math.cos(angle) * (ent.radius + 15),
-                              y: ent.position.y + Math.sin(angle) * (ent.radius + 15)
-                          };
-                      }
-                  });
-                  ent.garrison = [];
-                  playSound('click');
-              }
-          }
-
-          if (detail.action === 'SET_RALLY') {
-              const ent = gameStateRef.current.entities.get(detail.id);
-              if (ent) {
-                  ent.rallyPoint = detail.pos;
-                  ent.rallyTargetId = detail.targetId;
-                  playSound('click');
-              }
-          }
-      };
-      window.addEventListener('GAME_COMMAND', handleCommand);
-      return () => window.removeEventListener('GAME_COMMAND', handleCommand);
-  }, []);
-
-  // Keyboard Listeners
-  useEffect(() => {
-      const onKeyDown = (e: KeyboardEvent) => {
-          keysPressed.current.add(e.code);
-
-          const key = e.key.toUpperCase();
-          if ((e.target as HTMLElement).tagName === 'INPUT') return;
-
-          // Attack Move Shortcut
-          if (key === 'A') {
-              const hasAttackers = gameStateRef.current.selection.some(id => {
-                  const ent = gameStateRef.current.entities.get(id);
-                  return ent && ent.owner === Owner.PLAYER && STATS[ent.type].damage > 0;
-              });
-              if (hasAttackers) {
-                  setCommandMode('ATTACK');
-              }
-          }
-
-          // Pause Shortcut
-          if (key === 'P') {
-              gameStateRef.current.paused = !gameStateRef.current.paused;
-              onGameStateUpdate({ ...gameStateRef.current });
-          }
-
-          // Shortcuts
-          if (key === '1') {
-              const workers = Array.from(gameStateRef.current.entities.values()).filter(ent => 
-                  ent.owner === Owner.PLAYER && ent.type === EntityType.WORKER
-              );
-              let target = workers.find(w => w.state === 'IDLE');
-              if (!target) target = workers.find(w => w.state === 'GATHERING');
-              if (!target && workers.length > 0) target = workers[0];
-
-              if (target) {
-                  gameStateRef.current.selection = [target.id];
-                  onSelectionChange([target]);
-                  playSound('click');
-              }
-          }
-          if (key === '2') {
-              const marines = Array.from(gameStateRef.current.entities.values()).filter(ent => 
-                  ent.owner === Owner.PLAYER && ent.type === EntityType.MARINE
-              );
-              if (marines.length > 0) {
-                  gameStateRef.current.selection = marines.map(m => m.id);
-                  onSelectionChange(marines);
-                  playSound('click');
-              }
-          }
-      };
-      const onKeyUp = (e: KeyboardEvent) => keysPressed.current.delete(e.code);
-      window.addEventListener('keydown', onKeyDown);
-      window.addEventListener('keyup', onKeyUp);
-      return () => {
-          window.removeEventListener('keydown', onKeyDown);
-          window.removeEventListener('keyup', onKeyUp);
-      };
-  }, [onSelectionChange, setCommandMode]);
-
-  const getWorldPos = (clientX: number, clientY: number) => {
-    if (!canvasRef.current) return { x: 0, y: 0 };
-    const rect = canvasRef.current.getBoundingClientRect();
-    const x = clientX - rect.left + gameStateRef.current.camera.x;
-    const y = clientY - rect.top + gameStateRef.current.camera.y;
-    return { x, y };
-  };
-
-  const draw = (ctx: CanvasRenderingContext2D) => {
-    const state = gameStateRef.current;
-    const { width, height } = ctx.canvas;
-    const mousePos = mousePosRef.current;
-
-    // Filter Visible Entities
-    const allEntities = Array.from(state.entities.values());
-    const playerUnits = allEntities.filter(e => e.owner === Owner.PLAYER && e.state !== 'GARRISONED');
-    const visibleEntities = new Set<string>();
-    allEntities.forEach(e => {
-        if (e.state === 'GARRISONED') return;
-        if (isEntityVisible(e, playerUnits)) visibleEntities.add(e.id);
-    });
-
-    // --- FOG UPDATE (Offscreen) ---
-    if (exploredCanvasRef.current && visionCanvasRef.current) {
-        const ctxExp = exploredCanvasRef.current.getContext('2d');
-        const ctxVis = visionCanvasRef.current.getContext('2d');
-        if (ctxExp && ctxVis) {
-            // Update Explored
-            ctxExp.globalCompositeOperation = 'destination-out';
-            ctxExp.fillStyle = 'white';
-            
-            // Setup Current Vision
-            ctxVis.globalCompositeOperation = 'source-over';
-            ctxVis.fillStyle = 'rgba(0, 0, 0, 0.6)'; 
-            ctxVis.fillRect(0, 0, GAME_WIDTH, GAME_HEIGHT);
-            ctxVis.globalCompositeOperation = 'destination-out';
-            ctxVis.fillStyle = 'white';
-
-            playerUnits.forEach(u => {
-                const range = STATS[u.type].vision;
-                ctxExp.beginPath();
-                ctxExp.arc(u.position.x, u.position.y, range, 0, Math.PI * 2);
-                ctxExp.fill();
-
-                ctxVis.beginPath();
-                ctxVis.arc(u.position.x, u.position.y, range, 0, Math.PI * 2);
-                ctxVis.fill();
-            });
-        }
+    // 2. Noise/Dust
+    for (let i = 0; i < 40000; i++) {
+        const x = Math.random() * GAME_WIDTH;
+        const y = Math.random() * GAME_HEIGHT;
+        const s = Math.random() * 3 + 1;
+        ctx.fillStyle = Math.random() > 0.5 ? '#292524' : '#0c0a09';
+        ctx.globalAlpha = 0.3;
+        ctx.fillRect(x, y, s, s);
     }
 
-    // --- DRAW WORLD ---
-    ctx.fillStyle = '#1a1a1a';
-    ctx.fillRect(0, 0, width, height);
-
-    ctx.save();
-    ctx.translate(-state.camera.x, -state.camera.y);
-
-    // Grid
-    ctx.strokeStyle = '#222';
+    // 3. Subtle Grid Overlay
+    ctx.strokeStyle = '#333';
     ctx.lineWidth = 1;
+    ctx.globalAlpha = 0.1;
     for (let x = 0; x <= GAME_WIDTH; x += 100) {
-      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, GAME_HEIGHT); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, GAME_HEIGHT); ctx.stroke();
     }
     for (let y = 0; y <= GAME_HEIGHT; y += 100) {
-      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(GAME_WIDTH, y); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(GAME_WIDTH, y); ctx.stroke();
     }
     
-    ctx.strokeStyle = '#444';
-    ctx.strokeRect(0,0, GAME_WIDTH, GAME_HEIGHT);
-
-    // Markers
-    state.markers.forEach(mk => {
-        const lifePct = mk.life / mk.maxLife;
-        ctx.save();
-        ctx.translate(mk.position.x, mk.position.y);
-        ctx.globalAlpha = lifePct;
-        if (mk.type === 'MOVE') {
-             ctx.strokeStyle = '#4ade80'; // Green
-             ctx.lineWidth = 2;
-             const r = 15 * (0.5 + lifePct * 0.5); 
-             ctx.beginPath();
-             for(let i=0; i<4; i++) {
-                 ctx.rotate(Math.PI/2);
-                 ctx.moveTo(0, -r); ctx.lineTo(4, -r-4); ctx.moveTo(0, -r); ctx.lineTo(-4, -r-4);
-             }
-             ctx.stroke();
-        } else if (mk.type === 'ATTACK') {
-             ctx.strokeStyle = '#ef4444'; // Red
-             ctx.lineWidth = 2;
-             ctx.beginPath();
-             const r = 10;
-             ctx.moveTo(-r, -r); ctx.lineTo(r, r);
-             ctx.moveTo(r, -r); ctx.lineTo(-r, r);
-             ctx.stroke();
-        } else if (mk.type === 'LOAD') {
-            ctx.strokeStyle = '#fbbf24'; // Yellow
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            ctx.arc(0, 0, 10 + lifePct * 10, 0, Math.PI * 2);
-            ctx.stroke();
-        }
-        ctx.restore();
-    });
-    ctx.globalAlpha = 1.0;
-
-    // Entities
-    state.entities.forEach(entity => {
-      // VISIBILITY CHECK
-      if (!visibleEntities.has(entity.id)) return;
-
-      ctx.save();
-      ctx.translate(entity.position.x, entity.position.y);
-
-      // Rally Point
-      if (state.selection.includes(entity.id) && entity.rallyPoint && (entity.type === EntityType.BASE || entity.type === EntityType.BARRACKS)) {
-          ctx.save();
-          ctx.strokeStyle = '#fbbf24'; 
-          ctx.setLineDash([5, 5]);
-          ctx.beginPath();
-          ctx.moveTo(0, 0); 
-          ctx.lineTo(entity.rallyPoint.x - entity.position.x, entity.rallyPoint.y - entity.position.y);
-          ctx.stroke();
-          ctx.restore();
-      }
-
-      // Selection Ring
-      if (state.selection.includes(entity.id)) {
-        ctx.strokeStyle = '#00ff00';
-        ctx.lineWidth = 2;
+    // 4. Craters / Details
+    ctx.globalAlpha = 0.2;
+    for (let i = 0; i < 50; i++) {
+        const cx = Math.random() * GAME_WIDTH;
+        const cy = Math.random() * GAME_HEIGHT;
+        const r = Math.random() * 50 + 20;
+        ctx.fillStyle = '#000';
         ctx.beginPath();
-        ctx.arc(0, 0, entity.radius + 5, 0, Math.PI * 2);
-        ctx.stroke();
-      }
-
-      // Body Drawing
-      if (entity.type === EntityType.MINERAL) {
-        ctx.fillStyle = '#38bdf8'; 
-        ctx.beginPath();
-        ctx.moveTo(0, -12); ctx.lineTo(10, -5); ctx.lineTo(6, 8); ctx.lineTo(-6, 8); ctx.lineTo(-10, -5);
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
         ctx.fill();
-        ctx.strokeStyle = '#0ea5e9';
-        ctx.stroke();
-      } else if (entity.type === EntityType.MOUNTAIN) {
-        ctx.fillStyle = '#4b5563'; 
+        ctx.fillStyle = '#444'; // Highlight edge
         ctx.beginPath();
-        ctx.moveTo(0, -40); 
-        ctx.lineTo(30, -10); ctx.lineTo(20, 20); ctx.lineTo(40, 40);
-        ctx.lineTo(0, 30); ctx.lineTo(-30, 40); ctx.lineTo(-40, 10); ctx.lineTo(-20, -20);
+        ctx.arc(cx + 2, cy + 2, r * 0.9, 0, Math.PI * 2);
         ctx.fill();
-        ctx.fillStyle = '#6b7280';
-        ctx.beginPath();
-        ctx.moveTo(0, -40); ctx.lineTo(15, 0); ctx.lineTo(-5, 5);
-        ctx.fill();
-      } else if (entity.type === EntityType.WATER) {
-        ctx.fillStyle = '#1e3a8a';
-        ctx.beginPath(); ctx.arc(0,0, 30, 0, Math.PI*2); ctx.fill();
-        ctx.strokeStyle = '#3b82f6';
-        ctx.lineWidth = 2;
-        ctx.beginPath(); ctx.arc(0,0, 25, 0, Math.PI*2); ctx.stroke();
-        ctx.strokeStyle = 'rgba(255,255,255,0.3)';
-        ctx.beginPath(); 
-        ctx.moveTo(-15, 0); ctx.quadraticCurveTo(0, -10, 15, 0);
-        ctx.stroke();
-      } else {
-        ctx.fillStyle = entity.owner === Owner.PLAYER ? '#3b82f6' : '#ef4444';
+    }
+
+    return canvas;
+};
+
+const isEntityVisible = (entity: GameEntity, playerUnits: GameEntity[]) => {
+    if (entity.owner === Owner.PLAYER) return true;
+    return true; 
+};
+
+const drawUnit = (ctx: CanvasRenderingContext2D, entity: GameEntity, isSelected: boolean) => {
+    ctx.save();
+    ctx.translate(entity.position.x, entity.position.y);
+    
+    const isPlayer = entity.owner === Owner.PLAYER;
+    const isEnemy = entity.owner === Owner.AI || entity.owner === Owner.OPPONENT;
+    const primaryColor = isPlayer ? '#3b82f6' : (isEnemy ? '#ef4444' : '#9ca3af'); // Blue : Red : Gray
+    
+    // Shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    ctx.beginPath();
+    ctx.ellipse(3, 3, entity.radius, entity.radius * 0.7, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Construction Scaffold
+    if (entity.constructionProgress !== undefined && entity.constructionProgress < 100) {
+        ctx.globalAlpha = 0.6;
+        ctx.strokeStyle = '#fbbf24';
+        ctx.setLineDash([4, 2]);
+        ctx.strokeRect(-entity.radius, -entity.radius, entity.radius*2, entity.radius*2);
+        ctx.setLineDash([]);
+        ctx.globalAlpha = 1.0;
         
-        if (entity.type === EntityType.BASE) {
-          ctx.fillRect(-30, -30, 60, 60);
-          ctx.fillStyle = '#1e3a8a';
-          ctx.fillRect(-10, 10, 20, 20);
-          ctx.strokeStyle = 'rgba(255,255,255,0.3)';
-          ctx.beginPath(); ctx.moveTo(-30, -30); ctx.lineTo(30,30); ctx.stroke();
-          ctx.beginPath(); ctx.moveTo(30, -30); ctx.lineTo(-30,30); ctx.stroke();
-        } else if (entity.type === EntityType.BARRACKS) {
-            ctx.fillRect(-25, -25, 50, 50);
-            ctx.fillStyle = '#1f2937';
-            ctx.fillRect(-15, -15, 30, 30);
-        } else if (entity.type === EntityType.BUNKER) {
-            ctx.fillRect(-20, -20, 40, 40);
-            ctx.fillStyle = '#374151';
-            ctx.fillRect(-15, -5, 30, 10); // Slit
-            // Indicators for garrison
-            if (entity.garrison && entity.garrison.length > 0) {
-                 ctx.fillStyle = '#22c55e';
-                 for(let i=0; i<entity.garrison.length; i++) {
-                     ctx.beginPath(); ctx.arc(-12 + i * 8, 12, 3, 0, Math.PI*2); ctx.fill();
-                 }
-            }
-        } else if (entity.type === EntityType.SUPPLY_DEPOT) {
-            ctx.fillRect(-15, -15, 30, 30);
-            ctx.beginPath(); ctx.moveTo(-15, -15); ctx.lineTo(15,15); ctx.stroke();
-        } else if (entity.type === EntityType.WORKER) {
-            ctx.beginPath(); ctx.arc(0, 0, 6, 0, Math.PI * 2); ctx.fill();
-            ctx.fillStyle = '#9ca3af';
-            ctx.beginPath(); ctx.arc(4, 4, 3, 0, Math.PI * 2); ctx.fill();
+        // Progress bar for construction
+        ctx.fillStyle = '#000';
+        ctx.fillRect(-15, -10, 30, 4);
+        ctx.fillStyle = '#fbbf24';
+        ctx.fillRect(-15, -10, 30 * (entity.constructionProgress / 100), 4);
+    } else {
+        // Normal Rendering
+        if (entity.type === EntityType.WORKER) {
+            // Body
+            const grad = ctx.createRadialGradient(-2, -2, 1, 0, 0, 8);
+            grad.addColorStop(0, '#e5e7eb');
+            grad.addColorStop(1, '#9ca3af');
+            ctx.fillStyle = grad;
+            ctx.beginPath(); ctx.arc(0, 0, 6, 0, Math.PI*2); ctx.fill();
+            // Team indicator
+            ctx.fillStyle = primaryColor;
+            ctx.beginPath(); ctx.arc(0, -3, 3, 0, Math.PI*2); ctx.fill();
+            // Resource bag
             if (entity.resourceAmount && entity.resourceAmount > 0) {
-                ctx.fillStyle = '#38bdf8'; 
-                ctx.beginPath(); ctx.arc(0, -6, 4, 0, Math.PI * 2); ctx.fill();
+                ctx.fillStyle = '#06b6d4'; // Cyan crystal
+                ctx.fillRect(-3, 2, 6, 4);
             }
         } else if (entity.type === EntityType.MARINE) {
-            ctx.beginPath(); ctx.arc(0, 0, 7, 0, Math.PI * 2); ctx.fill();
-            ctx.strokeStyle = 'white';
-            ctx.lineWidth = 3;
-            ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(10, 0); ctx.stroke();
+             ctx.fillStyle = primaryColor;
+             ctx.beginPath(); ctx.arc(0, 0, 7, 0, Math.PI*2); ctx.fill();
+             // Gun
+             ctx.strokeStyle = '#1f2937';
+             ctx.lineWidth = 3;
+             ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(8, 2); ctx.stroke();
         } else if (entity.type === EntityType.MEDIC) {
-            ctx.fillStyle = '#e5e7eb'; // White
-            ctx.beginPath(); ctx.arc(0, 0, 7, 0, Math.PI * 2); ctx.fill();
-            // Red Cross
-            ctx.fillStyle = '#ef4444';
-            ctx.fillRect(-2, -5, 4, 10);
-            ctx.fillRect(-5, -2, 10, 4);
-        }
-
-        // HP Bar
-        if (entity.hp < entity.maxHp || state.selection.includes(entity.id)) {
-            const pct = Math.max(0, entity.hp / entity.maxHp);
-            const w = 24;
-            ctx.fillStyle = 'red';
-            ctx.fillRect(-w/2, -entity.radius - 10, w, 4);
-            ctx.fillStyle = '#22c55e'; // Green
-            ctx.fillRect(-w/2, -entity.radius - 10, w * pct, 4);
-        }
-
-        if (entity.constructionProgress! < 100) {
-            ctx.fillStyle = 'yellow';
-            ctx.fillRect(-15, 0, 30, 4);
-            ctx.fillStyle = 'blue';
-            ctx.fillRect(-15, 0, 30 * (entity.constructionProgress! / 100), 4);
-        }
-        
-        if (entity.trainQueue && entity.trainQueue.length > 0) {
-             ctx.fillStyle = 'white';
-             ctx.beginPath(); ctx.arc(0, -entity.radius-15, 2, 0, Math.PI*2); ctx.fill();
-        }
-      }
-      ctx.restore();
-      
-      // Attack Lines
-      if (entity.state === 'ATTACKING' && entity.targetId && entity.cooldown > STATS[entity.type].attackSpeed - 5) {
-          const target = state.entities.get(entity.targetId);
-          if (target && visibleEntities.has(target.id)) {
-              ctx.strokeStyle = entity.type === EntityType.MARINE ? 'yellow' : 'white';
-              ctx.lineWidth = entity.type === EntityType.MARINE ? 2 : 1;
-              ctx.beginPath();
-              ctx.moveTo(entity.position.x, entity.position.y);
-              ctx.lineTo(target.position.x, target.position.y);
-              ctx.stroke();
-          }
-      }
-      // Bunker Attack Line
-      if (entity.type === EntityType.BUNKER && entity.targetId && entity.cooldown > STATS[entity.type].attackSpeed - 5) {
-          const target = state.entities.get(entity.targetId);
-           if (target && visibleEntities.has(target.id)) {
-              ctx.strokeStyle = 'yellow';
-              ctx.lineWidth = 2;
-              ctx.beginPath();
-              ctx.moveTo(entity.position.x, entity.position.y);
-              ctx.lineTo(target.position.x, target.position.y);
-              ctx.stroke();
-           }
-      }
-      // Medic Beam
-      if (entity.state === 'HEALING' && entity.targetId && entity.cooldown > STATS[entity.type].attackSpeed - 10) {
-          const target = state.entities.get(entity.targetId);
-           if (target) {
-              ctx.strokeStyle = '#22c55e';
-              ctx.lineWidth = 2;
-              ctx.setLineDash([5, 5]);
-              ctx.beginPath();
-              ctx.moveTo(entity.position.x, entity.position.y);
-              ctx.lineTo(target.position.x, target.position.y);
-              ctx.stroke();
-              ctx.setLineDash([]);
-           }
-      }
-    });
-
-    // --- DRAW EFFECTS ---
-    state.effects.forEach(fx => {
-        let visible = false;
-        for(const u of playerUnits) {
-             const d = Math.sqrt(Math.pow(u.position.x - fx.position.x, 2) + Math.pow(u.position.y - fx.position.y, 2));
-             if (d < STATS[u.type].vision) { visible = true; break; }
-        }
-        if (!visible) return;
-
-        ctx.save();
-        ctx.translate(fx.position.x, fx.position.y);
-        const lifePct = fx.life / fx.maxLife; 
-        
-        if (fx.type === 'EXPLOSION') {
-            const r = (1 - lifePct) * 40 * fx.scale;
-            ctx.globalAlpha = lifePct;
-            ctx.fillStyle = '#fff7ed'; 
-            ctx.beginPath(); ctx.arc(0,0, r * 0.5, 0, Math.PI*2); ctx.fill();
-            ctx.fillStyle = '#ea580c'; 
-            ctx.beginPath(); ctx.arc(0,0, r, 0, Math.PI*2); ctx.fill();
-        } else if (fx.type === 'BUILDING_EXPLOSION') {
-             const r = (1 - lifePct) * 80;
-             ctx.globalAlpha = lifePct;
-             ctx.fillStyle = '#fef08a';
-             ctx.beginPath(); ctx.arc(0,0, r, 0, Math.PI*2); ctx.fill();
-             
-             for(let i=0; i<5; i++) {
-                 const offsetAngle = (i/5) * Math.PI*2 + state.gameTime * 0.1;
-                 const ex = Math.cos(offsetAngle) * r * 0.5;
-                 const ey = Math.sin(offsetAngle) * r * 0.5;
-                 ctx.fillStyle = i % 2 === 0 ? '#ef4444' : '#f97316';
-                 ctx.beginPath(); ctx.arc(ex, ey, r*0.6, 0, Math.PI*2); ctx.fill();
+             ctx.fillStyle = '#fff';
+             ctx.beginPath(); ctx.arc(0, 0, 7, 0, Math.PI*2); ctx.fill();
+             // Cross
+             ctx.fillStyle = '#ef4444';
+             ctx.fillRect(-2, -5, 4, 10);
+             ctx.fillRect(-5, -2, 10, 4);
+        } else if (entity.type === EntityType.BASE) {
+             ctx.fillStyle = isPlayer ? '#1e3a8a' : '#7f1d1d';
+             ctx.fillRect(-25, -25, 50, 50);
+             ctx.fillStyle = primaryColor;
+             ctx.fillRect(-20, -20, 40, 40);
+             // Roof detail
+             ctx.fillStyle = 'rgba(255,255,255,0.1)';
+             ctx.beginPath(); ctx.moveTo(-20, -20); ctx.lineTo(20, 20); ctx.lineTo(-20, 20); ctx.fill();
+        } else if (entity.type === EntityType.BARRACKS) {
+             ctx.fillStyle = '#374151';
+             ctx.fillRect(-20, -20, 40, 40);
+             ctx.strokeStyle = primaryColor;
+             ctx.lineWidth = 2;
+             ctx.strokeRect(-20, -20, 40, 40);
+             // Hatch
+             ctx.fillStyle = '#111';
+             ctx.fillRect(-10, -10, 20, 20);
+        } else if (entity.type === EntityType.BUNKER) {
+             ctx.fillStyle = '#4b5563';
+             // Hexagon
+             ctx.beginPath();
+             for (let i = 0; i < 6; i++) {
+                 const angle = (i * Math.PI) / 3;
+                 ctx.lineTo(Math.cos(angle) * 20, Math.sin(angle) * 20);
              }
-        } else if (fx.type === 'BLOOD') {
-            ctx.fillStyle = '#991b1b'; 
-            ctx.globalAlpha = lifePct;
-            ctx.beginPath(); ctx.arc(0,0, 10, 0, Math.PI*2); ctx.fill();
-            ctx.beginPath(); ctx.arc(5,5, 6, 0, Math.PI*2); ctx.fill();
-        } else if (fx.type === 'HEAL') {
-            ctx.strokeStyle = '#22c55e';
-            ctx.globalAlpha = lifePct;
-            ctx.lineWidth = 2;
-            ctx.beginPath(); 
-            ctx.moveTo(0, -10 + lifePct * 10); ctx.lineTo(0, -20);
-            ctx.moveTo(-5, -15); ctx.lineTo(5, -15);
-            ctx.stroke();
-        }
-        ctx.restore();
-    });
-    ctx.globalAlpha = 1.0;
-    
-    // --- DRAW FOG OVERLAY ---
-    if (visionCanvasRef.current) ctx.drawImage(visionCanvasRef.current, 0, 0); 
-    if (exploredCanvasRef.current) ctx.drawImage(exploredCanvasRef.current, 0, 0);
-
-    // Selection Box
-    if (mouseDownStateRef.current) {
-        const currentWorldPos = {
-            x: mousePos.x + state.camera.x,
-            y: mousePos.y + state.camera.y
-        };
-        const startWorld = mouseDownStateRef.current.world;
-        ctx.strokeStyle = '#22c55e';
-        ctx.lineWidth = 1;
-        ctx.setLineDash([5, 5]);
-        ctx.strokeRect(startWorld.x, startWorld.y, currentWorldPos.x - startWorld.x, currentWorldPos.y - startWorld.y);
-        ctx.setLineDash([]);
-    }
-    
-    // Ghost Building
-    if (commandMode && commandMode.startsWith('BUILD_')) {
-       const type = commandMode.replace('BUILD_', '') as EntityType;
-       const worldMouse = { x: mousePos.x + state.camera.x, y: mousePos.y + state.camera.y };
-       const stats = STATS[type];
-       ctx.fillStyle = 'rgba(34, 197, 94, 0.5)';
-       ctx.fillRect(worldMouse.x - stats.width/2, worldMouse.y - stats.height/2, stats.width, stats.height);
-       ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
-       ctx.strokeRect(worldMouse.x - stats.width/2, worldMouse.y - stats.height/2, stats.width, stats.height);
-    }
-    
-    // Pause Overlay
-    if (state.paused) {
-        ctx.save();
-        ctx.setTransform(1, 0, 0, 1, 0, 0); // Reset transform
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
-        ctx.fillRect(0, 0, width, height);
-        ctx.fillStyle = 'white';
-        ctx.font = 'bold 48px sans-serif';
-        ctx.textAlign = 'center';
-        ctx.shadowColor = 'black';
-        ctx.shadowBlur = 10;
-        ctx.fillText('PAUSED', width / 2, height / 2);
-        ctx.restore();
-    }
-    
-    // Notifications (Screen Space)
-    ctx.restore(); // Undo Camera transform for HUD-like elements
-    if (state.notifications.length > 0) {
-        ctx.save();
-        ctx.font = 'bold 24px sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillStyle = '#f87171';
-        ctx.shadowColor = 'black';
-        ctx.shadowBlur = 4;
-        
-        state.notifications.forEach((n, i) => {
-            const y = height - 250 - (i * 30);
-            const alpha = Math.min(1, n.life / 30);
-            ctx.globalAlpha = alpha;
-            ctx.fillText(n.text, width / 2, y);
-        });
-        ctx.restore();
-    }
-
-  };
-
-  const loop = () => {
-    if (!gameStateRef.current.victory && !gameStateRef.current.paused) {
-        gameStateRef.current = updateGame(gameStateRef.current);
-        if (gameStateRef.current.soundEvents.length > 0) {
-            gameStateRef.current.soundEvents.forEach(evt => playSound(evt as any));
-            gameStateRef.current.soundEvents = [];
-        }
-    }
-    
-    const mousePos = mousePosRef.current;
-    
-    // Edge Panning
-    const panSpeed = 15;
-    const margin = 20;
-    const keySpeed = 20;
-    
-    if (keysPressed.current.has('ArrowLeft')) gameStateRef.current.camera.x -= keySpeed;
-    if (keysPressed.current.has('ArrowRight')) gameStateRef.current.camera.x += keySpeed;
-    if (keysPressed.current.has('ArrowUp')) gameStateRef.current.camera.y -= keySpeed;
-    if (keysPressed.current.has('ArrowDown')) gameStateRef.current.camera.y += keySpeed;
-
-    if (!isDraggingCamera.current && !isRightDragging.current) {
-        if (mousePos.x < margin && mousePos.x >= 0) gameStateRef.current.camera.x -= panSpeed;
-        if (mousePos.x > window.innerWidth - margin && mousePos.x <= window.innerWidth) gameStateRef.current.camera.x += panSpeed;
-        if (mousePos.y < margin && mousePos.y >= 0) gameStateRef.current.camera.y -= panSpeed;
-        if (mousePos.y > window.innerHeight - margin && mousePos.y <= window.innerHeight) gameStateRef.current.camera.y += panSpeed;
-    }
-
-    gameStateRef.current.camera.x = Math.max(0, Math.min(gameStateRef.current.camera.x, GAME_WIDTH - window.innerWidth));
-    gameStateRef.current.camera.y = Math.max(0, Math.min(gameStateRef.current.camera.y, GAME_HEIGHT - window.innerHeight));
-
-    if (canvasRef.current) {
-      draw(canvasRef.current.getContext('2d')!);
-    }
-
-    if (gameStateRef.current.gameTime % 5 === 0 || gameStateRef.current.paused) {
-        onGameStateUpdate({ ...gameStateRef.current });
-    }
-
-    requestRef.current = requestAnimationFrame(loop);
-  };
-
-  useEffect(() => {
-    requestRef.current = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(requestRef.current!);
-  }, [commandMode]); 
-
-  // --- Input Handlers ---
-  const handleMouseDown = (e: React.MouseEvent) => {
-    if (gameStateRef.current.paused) return; // Ignore inputs when paused
-
-    if (e.button === 1) {
-        e.preventDefault();
-        isDraggingCamera.current = true;
-        lastDragPos.current = { x: e.clientX, y: e.clientY };
-        return;
-    }
-
-    if (e.button === 2) { 
-        e.preventDefault();
-        rightDragStart.current = { x: e.clientX, y: e.clientY };
-        lastDragPos.current = { x: e.clientX, y: e.clientY };
-        isRightDragging.current = false;
-        return;
-    }
-
-    if (e.button === 0) { 
-      if (commandMode === 'ATTACK') {
-          const pos = getWorldPos(e.clientX, e.clientY);
-          // Check Visibility for interaction
-          const allEntities = Array.from(gameStateRef.current.entities.values());
-          const playerUnits = allEntities.filter(e => e.owner === Owner.PLAYER);
-
-          const clickedEntity = allEntities.find(ent => {
-             const dist = Math.sqrt(Math.pow(ent.position.x - pos.x, 2) + Math.pow(ent.position.y - pos.y, 2));
-             if (dist < ent.radius + 15) {
-                 return isEntityVisible(ent, playerUnits);
-             }
-             return false;
-          });
-          
-          gameStateRef.current.selection.forEach(id => {
-              const unit = gameStateRef.current.entities.get(id);
-              if (unit && unit.owner === Owner.PLAYER) {
-                  unit.state = 'ATTACKING';
-                  unit.targetPosition = pos; // Default Attack Move to ground
-                  unit.targetId = null;
-
-                  if (clickedEntity && clickedEntity.owner !== Owner.PLAYER) {
-                      unit.targetId = clickedEntity.id;
-                      unit.targetPosition = null;
-                  }
-
-                  gameStateRef.current.markers.push({
-                      id: `mk_${Math.random()}`,
-                      position: clickedEntity ? clickedEntity.position : pos,
-                      type: 'ATTACK',
-                      life: 20, maxLife: 20
-                  });
-              }
-          });
-          setCommandMode(null);
-          playSound('click');
-          return;
-      }
-
-      if (commandMode && commandMode.startsWith('BUILD_')) {
-          const type = commandMode.replace('BUILD_', '') as EntityType;
-          const pos = getWorldPos(e.clientX, e.clientY);
-          const stats = STATS[type];
-          
-          if (gameStateRef.current.resources[Owner.PLAYER] >= stats.cost) {
-             gameStateRef.current.resources[Owner.PLAYER] -= stats.cost;
-             const b = createEntity(type, Owner.PLAYER, pos);
-             b.constructionProgress = 0; 
-             gameStateRef.current.entities.set(b.id, b);
-             setCommandMode(null);
-             playSound('build');
-          } else {
-              addNotification(gameStateRef.current, "Not Enough Minerals!");
-              playSound('error');
-          }
-          return;
-      }
-      
-      const worldPos = getWorldPos(e.clientX, e.clientY);
-      mouseDownStateRef.current = {
-          screen: { x: e.clientX, y: e.clientY },
-          world: worldPos
-      };
-    }
-  };
-
-  const handleMouseMove = (e: React.MouseEvent) => {
-    mousePosRef.current = { x: e.clientX, y: e.clientY };
-    
-    if (gameStateRef.current.paused) return;
-
-    if (isDraggingCamera.current) {
-        const dx = e.clientX - lastDragPos.current.x;
-        const dy = e.clientY - lastDragPos.current.y;
-        gameStateRef.current.camera.x -= dx;
-        gameStateRef.current.camera.y -= dy;
-        lastDragPos.current = { x: e.clientX, y: e.clientY };
-        return;
-    }
-
-    if (e.buttons === 2) {
-        const dist = Math.sqrt(Math.pow(e.clientX - rightDragStart.current.x, 2) + Math.pow(e.clientY - rightDragStart.current.y, 2));
-        if (dist > 5) {
-            isRightDragging.current = true;
-        }
-
-        if (isRightDragging.current) {
-            const dx = e.clientX - lastDragPos.current.x;
-            const dy = e.clientY - lastDragPos.current.y;
-            gameStateRef.current.camera.x -= dx;
-            gameStateRef.current.camera.y -= dy;
-            lastDragPos.current = { x: e.clientX, y: e.clientY };
-        }
-    }
-  };
-
-  const handleMouseUp = (e: React.MouseEvent) => {
-     if (gameStateRef.current.paused) return;
-
-     if (e.button === 1) {
-         isDraggingCamera.current = false;
-         return;
-     }
-
-     if (e.button === 2) { 
-         e.preventDefault();
-         if (!isRightDragging.current) {
-             const pos = getWorldPos(e.clientX, e.clientY);
-             
-             // Check Visibility for Interaction
-             const allEntities = Array.from(gameStateRef.current.entities.values());
-             const playerUnits = allEntities.filter(e => e.owner === Owner.PLAYER && e.state !== 'GARRISONED');
-             
-             const clickedEntity = allEntities.find(ent => {
-                 const dist = Math.sqrt(Math.pow(ent.position.x - pos.x, 2) + Math.pow(ent.position.y - pos.y, 2));
-                 if (dist < ent.radius + 15) {
-                     return isEntityVisible(ent, playerUnits);
-                 }
-                 return false;
-             });
-
-             const hasBuildingsSelected = gameStateRef.current.selection.some(id => {
-                 const ent = gameStateRef.current.entities.get(id);
-                 return ent && ent.owner === Owner.PLAYER && (ent.type === EntityType.BASE || ent.type === EntityType.BARRACKS);
-             });
-
-             if (hasBuildingsSelected) {
-                  gameStateRef.current.selection.forEach(id => {
-                      const ent = gameStateRef.current.entities.get(id);
-                      if (ent && ent.owner === Owner.PLAYER && (ent.type === EntityType.BASE || ent.type === EntityType.BARRACKS)) {
-                          window.dispatchEvent(new CustomEvent('GAME_COMMAND', {
-                              detail: { action: 'SET_RALLY', id: ent.id, pos, targetId: clickedEntity ? clickedEntity.id : null }
-                          }));
-                      }
-                  });
-             } else {
-                 playSound('click');
-                 gameStateRef.current.selection.forEach(id => {
-                    const unit = gameStateRef.current.entities.get(id);
-                    if (unit && unit.owner === Owner.PLAYER) {
-                       if (clickedEntity) {
-                           if (clickedEntity.owner === Owner.NEUTRAL && clickedEntity.type === EntityType.MINERAL && unit.type === EntityType.WORKER) {
-                               unit.state = 'GATHERING';
-                               unit.targetId = clickedEntity.id;
-                               unit.targetPosition = null;
-                               gameStateRef.current.markers.push({ id: `mk_${Math.random()}`, position: { ...clickedEntity.position }, type: 'MOVE', life: 20, maxLife: 20 });
-                           } else if (clickedEntity.owner !== Owner.PLAYER && (unit.type === EntityType.MARINE || unit.type === EntityType.MEDIC)) {
-                               // Medic won't attack but will move to
-                               unit.state = unit.type === EntityType.MEDIC ? 'MOVING' : 'ATTACKING';
-                               unit.targetId = clickedEntity.id;
-                               unit.targetPosition = null;
-                               gameStateRef.current.markers.push({ id: `mk_${Math.random()}`, position: { ...clickedEntity.position }, type: 'ATTACK', life: 20, maxLife: 20 });
-                           } else if (clickedEntity.owner !== Owner.PLAYER && unit.type === EntityType.WORKER) {
-                               unit.state = 'ATTACKING';
-                               unit.targetId = clickedEntity.id;
-                               gameStateRef.current.markers.push({ id: `mk_${Math.random()}`, position: { ...clickedEntity.position }, type: 'ATTACK', life: 20, maxLife: 20 });
-                           } else if (clickedEntity.owner === Owner.PLAYER && clickedEntity.type === EntityType.BUNKER && unit.type === EntityType.MARINE) {
-                               // Load into Bunker
-                               unit.state = 'ENTERING';
-                               unit.targetId = clickedEntity.id;
-                               unit.targetPosition = null;
-                               gameStateRef.current.markers.push({ id: `mk_${Math.random()}`, position: { ...clickedEntity.position }, type: 'LOAD', life: 20, maxLife: 20 });
-                           }
-                       } else {
-                           unit.state = 'MOVING';
-                           unit.targetPosition = pos;
-                           unit.targetId = null;
-                           gameStateRef.current.markers.push({ id: `mk_${Math.random()}`, position: { ...pos }, type: 'MOVE', life: 20, maxLife: 20 });
-                       }
-                    }
+             ctx.closePath();
+             ctx.fill();
+             ctx.strokeStyle = primaryColor;
+             ctx.lineWidth = 3;
+             ctx.stroke();
+             if (entity.garrison && entity.garrison.length > 0) {
+                 ctx.fillStyle = '#10b981'; // Green slots
+                 entity.garrison.forEach((_, i) => {
+                     ctx.beginPath(); ctx.arc(-10 + i*6, 0, 2, 0, Math.PI*2); ctx.fill();
                  });
              }
-             setCommandMode(null);
-         }
-         isRightDragging.current = false;
-         return;
-     }
-
-     if (e.button === 0 && mouseDownStateRef.current) {
-         const screenDiffX = Math.abs(e.clientX - mouseDownStateRef.current.screen.x);
-         const screenDiffY = Math.abs(e.clientY - mouseDownStateRef.current.screen.y);
-         const isClick = (screenDiffX < 5 && screenDiffY < 5);
-         const currentWorldPos = getWorldPos(e.clientX, e.clientY);
-         const startWorld = mouseDownStateRef.current.world;
-         
-         const minX = Math.min(startWorld.x, currentWorldPos.x);
-         const maxX = Math.max(startWorld.x, currentWorldPos.x);
-         const minY = Math.min(startWorld.y, currentWorldPos.y);
-         const maxY = Math.max(startWorld.y, currentWorldPos.y);
-
-         const newSelection: string[] = [];
-         
-         // Only select Visible things (own units are always visible)
-         const allEntities = Array.from(gameStateRef.current.entities.values());
-         const playerUnits = allEntities.filter(e => e.owner === Owner.PLAYER && e.state !== 'GARRISONED');
-
-         gameStateRef.current.entities.forEach(ent => {
-             if (ent.type === EntityType.MOUNTAIN || ent.type === EntityType.WATER) return; 
-             if (ent.state === 'GARRISONED') return; // Cannot select garrisoned units directly
-
-             // Must be visible to be selected
-             if (!isEntityVisible(ent, playerUnits)) return;
-
-             if (!isClick && ent.owner !== Owner.PLAYER) return; 
-             
-             if (isClick) {
-                 const dx = ent.position.x - currentWorldPos.x;
-                 const dy = ent.position.y - currentWorldPos.y;
-                 if (Math.sqrt(dx*dx + dy*dy) < ent.radius + 15) { 
-                     newSelection.push(ent.id);
-                 }
-             } else {
-                 if (ent.position.x > minX && ent.position.x < maxX && 
-                     ent.position.y > minY && ent.position.y < maxY) {
-                         if (ent.owner === Owner.PLAYER) newSelection.push(ent.id);
-                     }
+        } else if (entity.type === EntityType.SUPPLY_DEPOT) {
+             ctx.fillStyle = '#374151';
+             ctx.fillRect(-15, -15, 30, 30);
+             ctx.fillStyle = primaryColor;
+             ctx.beginPath(); ctx.arc(0, 0, 10, 0, Math.PI*2); ctx.fill();
+        } else if (entity.type === EntityType.MINERAL) {
+             ctx.fillStyle = '#06b6d4';
+             ctx.beginPath();
+             ctx.moveTo(0, -10); ctx.lineTo(8, -2); ctx.lineTo(5, 8); ctx.lineTo(-5, 8); ctx.lineTo(-8, -2);
+             ctx.closePath();
+             ctx.fill();
+             ctx.strokeStyle = '#cffafe';
+             ctx.lineWidth = 1;
+             ctx.stroke();
+             // Glow
+             if (Math.random() > 0.95) {
+                 ctx.globalAlpha = 0.5;
+                 ctx.fillStyle = '#fff';
+                 ctx.beginPath(); ctx.arc(Math.random()*10-5, Math.random()*10-5, 2, 0, Math.PI*2); ctx.fill();
+                 ctx.globalAlpha = 1.0;
              }
-         });
-         
-         if (isClick) playSound('click');
+        } else if (entity.type === EntityType.MOUNTAIN) {
+            ctx.fillStyle = '#44403c';
+            ctx.beginPath();
+            ctx.moveTo(-30, 30); ctx.lineTo(-10, -20); ctx.lineTo(10, 0); ctx.lineTo(30, -30); ctx.lineTo(40, 30);
+            ctx.closePath();
+            ctx.fill();
+        } else if (entity.type === EntityType.WATER) {
+            ctx.fillStyle = '#1e3a8a';
+            ctx.beginPath(); ctx.arc(0, 0, 25, 0, Math.PI*2); ctx.fill();
+        }
+    }
 
-         if (isClick && newSelection.length > 1) {
-             gameStateRef.current.selection = [newSelection[0]];
-         } else {
-             gameStateRef.current.selection = newSelection;
-         }
-         
-         if (!isClick && newSelection.length > 0) {
-             const units = newSelection.filter(id => {
-                 const t = gameStateRef.current.entities.get(id)?.type;
-                 return t !== EntityType.BASE && t !== EntityType.BARRACKS && t !== EntityType.SUPPLY_DEPOT && t !== EntityType.BUNKER;
-             });
-             if (units.length > 0) gameStateRef.current.selection = units;
-         }
-         
-         const selectedEntities = gameStateRef.current.selection
-            .map(id => gameStateRef.current.entities.get(id)!)
-            .filter(Boolean);
+    // Selection & Health
+    if (isSelected) {
+        ctx.strokeStyle = '#10b981'; // Green selection
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(0, 0, entity.radius + 6, 0, Math.PI * 2);
+        ctx.stroke();
 
-         onSelectionChange(selectedEntities);
-         mouseDownStateRef.current = null;
-     }
-  };
-  
-  const handleMouseLeave = () => {
-     mouseDownStateRef.current = null;
-     isDraggingCamera.current = false;
-     isRightDragging.current = false;
-     mousePosRef.current = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
-  };
+        // HP Bar
+        const hpPct = entity.hp / entity.maxHp;
+        ctx.fillStyle = '#000';
+        ctx.fillRect(-12, -entity.radius - 12, 24, 4);
+        ctx.fillStyle = hpPct > 0.5 ? '#10b981' : (hpPct > 0.25 ? '#fbbf24' : '#ef4444');
+        ctx.fillRect(-12, -entity.radius - 12, 24 * hpPct, 4);
+    }
 
-  return (
-    <canvas
-      ref={canvasRef}
-      width={window.innerWidth}
-      height={window.innerHeight}
-      onMouseDown={handleMouseDown}
-      onMouseMove={handleMouseMove}
-      onMouseUp={handleMouseUp}
-      onMouseLeave={handleMouseLeave}
-      onContextMenu={(e) => e.preventDefault()}
-      className={`block ${commandMode === 'ATTACK' ? 'cursor-crosshair' : 'cursor-default'}`}
-    />
-  );
+    ctx.restore();
+};
+
+export const GameCanvas: React.FC<Props> = ({
+  onGameStateUpdate,
+  onSelectionChange,
+  commandMode,
+  setCommandMode,
+  isMultiplayer = false,
+  gameSeed = 123,
+  isHost = true,
+  difficulty = Difficulty.MEDIUM,
+  noRushSeconds = 0
+}) => {
+    const canvasRef = useRef<HTMLCanvasElement>(null);
+    const terrainCanvasRef = useRef<HTMLCanvasElement | null>(null);
+    const stateRef = useRef<GameState | null>(null);
+    const requestRef = useRef<number>();
+    const keysPressed = useRef<Set<string>>(new Set());
+    
+    const UI_BOTTOM_OVERLAY_HEIGHT = 256; 
+    
+    const [windowSize, setWindowSize] = useState({ width: window.innerWidth, height: window.innerHeight });
+    
+    // Mouse Interaction
+    const [dragStart, setDragStart] = useState<Vector2 | null>(null);
+    const [mousePos, setMousePos] = useState<Vector2 | null>(null);
+
+    useEffect(() => {
+        const handleResize = () => setWindowSize({ width: window.innerWidth, height: window.innerHeight });
+        window.addEventListener('resize', handleResize);
+        return () => window.removeEventListener('resize', handleResize);
+    }, []);
+
+    // Keyboard Listeners
+    useEffect(() => {
+        const onKeyDown = (e: KeyboardEvent) => {
+            keysPressed.current.add(e.code);
+            if ((e.target as HTMLElement).tagName === 'INPUT') return;
+            const key = e.key.toUpperCase();
+            
+            if (key === 'A') setCommandMode('ATTACK');
+            if (key === 'P') { 
+                if (stateRef.current) {
+                    stateRef.current.paused = !stateRef.current.paused; 
+                    onGameStateUpdate({...stateRef.current}); 
+                }
+            }
+
+            if (stateRef.current) {
+                // 1: Select Worker
+                if (key === '1') {
+                    const ents = Array.from(stateRef.current.entities.values()) as GameEntity[];
+                    const workers = ents.filter(e => e.owner === Owner.PLAYER && e.type === EntityType.WORKER);
+                    
+                    let target = workers.find(w => w.state === 'IDLE');
+                    if (!target) target = workers.find(w => w.state === 'GATHERING');
+                    if (!target && workers.length > 0) target = workers[0];
+                    
+                    if (target) {
+                        stateRef.current.selection = [target.id];
+                        onSelectionChange([target]);
+                        playSound('click');
+                    }
+                }
+
+                // 2: Select Army
+                if (key === '2') {
+                    const ents = Array.from(stateRef.current.entities.values()) as GameEntity[];
+                    const army = ents.filter(e => e.owner === Owner.PLAYER && (e.type === EntityType.MARINE || e.type === EntityType.MEDIC));
+                    if (army.length > 0) {
+                        const ids = army.map(u => u.id);
+                        stateRef.current.selection = ids;
+                        onSelectionChange(army);
+                        playSound('click');
+                    }
+                }
+
+                // Space: Center Camera
+                if (key === ' ') {
+                    e.preventDefault();
+                    if (stateRef.current.selection.length > 0) {
+                        const id = stateRef.current.selection[0];
+                        const ent = stateRef.current.entities.get(id);
+                        if (ent && canvasRef.current) {
+                            stateRef.current.camera.x = ent.position.x - window.innerWidth / 2;
+                            stateRef.current.camera.y = ent.position.y - window.innerHeight / 2;
+                        }
+                    } else {
+                        const base = Array.from(stateRef.current.entities.values()).find((e: GameEntity) => e.owner === Owner.PLAYER && e.type === EntityType.BASE);
+                        if (base && canvasRef.current) {
+                            stateRef.current.camera.x = base.position.x - window.innerWidth / 2;
+                            stateRef.current.camera.y = base.position.y - window.innerHeight / 2;
+                        }
+                    }
+                }
+            }
+        };
+        
+        const onKeyUp = (e: KeyboardEvent) => keysPressed.current.delete(e.code);
+        
+        window.addEventListener('keydown', onKeyDown);
+        window.addEventListener('keyup', onKeyUp);
+        return () => { 
+            window.removeEventListener('keydown', onKeyDown); 
+            window.removeEventListener('keyup', onKeyUp); 
+        };
+    }, [setCommandMode, onSelectionChange, onGameStateUpdate]);
+
+    // Initialize Game
+    useEffect(() => {
+        const initialState = initGame(difficulty, isMultiplayer, gameSeed, isHost, noRushSeconds);
+        stateRef.current = initialState;
+        onGameStateUpdate(initialState);
+        
+        // Render terrain once
+        terrainCanvasRef.current = renderTerrain();
+
+        // Reset
+        setCommandMode(null);
+        onSelectionChange([] as GameEntity[]);
+
+        return () => {
+            if (requestRef.current) cancelAnimationFrame(requestRef.current);
+        };
+    }, [gameSeed, isMultiplayer, isHost, difficulty, noRushSeconds]);
+
+    // Game Loop
+    const loop = useCallback(() => {
+        if (!stateRef.current) return;
+        
+        // 1. Update Game Logic
+        if (!stateRef.current.paused && !stateRef.current.victory) {
+            stateRef.current = updateGame(stateRef.current);
+            onGameStateUpdate(stateRef.current); // Sync to React state for UI
+            
+            // Play Sounds
+            stateRef.current.soundEvents.forEach(evt => {
+                if (['shoot', 'explosion', 'train', 'build', 'error', 'click'].includes(evt)) {
+                    playSound(evt as any);
+                }
+            });
+            // Clear sound events after playing
+            stateRef.current.soundEvents = [];
+        }
+
+        // Camera Logic
+        const panSpeed = 15;
+        if (keysPressed.current.has('ArrowLeft')) stateRef.current.camera.x -= panSpeed;
+        if (keysPressed.current.has('ArrowRight')) stateRef.current.camera.x += panSpeed;
+        if (keysPressed.current.has('ArrowUp')) stateRef.current.camera.y -= panSpeed;
+        if (keysPressed.current.has('ArrowDown')) stateRef.current.camera.y += panSpeed;
+
+        // Camera Clamping Logic
+        const maxCamX = Math.max(0, GAME_WIDTH - windowSize.width);
+        const maxCamY = Math.max(0, GAME_HEIGHT - windowSize.height + UI_BOTTOM_OVERLAY_HEIGHT);
+        stateRef.current.camera.x = Math.max(0, Math.min(stateRef.current.camera.x, maxCamX));
+        stateRef.current.camera.y = Math.max(0, Math.min(stateRef.current.camera.y, maxCamY));
+
+        // 2. Render
+        const canvas = canvasRef.current;
+        const ctx = canvas?.getContext('2d');
+        if (canvas && ctx && stateRef.current) {
+            const state = stateRef.current;
+            
+            // Clear
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            // Camera Transform
+            ctx.save();
+            ctx.translate(-state.camera.x, -state.camera.y);
+
+            // Draw Terrain
+            if (terrainCanvasRef.current) {
+                ctx.drawImage(terrainCanvasRef.current, 0, 0);
+            }
+
+            // Draw Entities
+            // Fix: Explicitly cast Array.from result to GameEntity[] to ensure type safety on entity properties
+            const sortedEntities = (Array.from(state.entities.values()) as GameEntity[]).sort((a: GameEntity, b: GameEntity) => a.position.y - b.position.y);
+            const playerUnits = sortedEntities.filter((e: GameEntity) => e.owner === Owner.PLAYER);
+
+            sortedEntities.forEach((entity: GameEntity) => {
+                if (entity.state === 'GARRISONED') return;
+                if (!isEntityVisible(entity, playerUnits)) return;
+                
+                const isSelected = state.selection.includes(entity.id);
+                drawUnit(ctx, entity, isSelected);
+            });
+
+            // Draw Effects
+            state.effects.forEach(effect => {
+                 ctx.save();
+                 const lifePct = effect.life / effect.maxLife;
+                 const scale = effect.scale * (1.5 - lifePct * 0.5); 
+                 
+                 if (effect.type === 'EXPLOSION' || effect.type === 'BUILDING_EXPLOSION') {
+                     ctx.translate(effect.position.x, effect.position.y);
+                     ctx.fillStyle = `rgba(255, 100, 0, ${lifePct})`;
+                     ctx.beginPath(); ctx.arc(0, 0, 15 * scale, 0, Math.PI*2); ctx.fill();
+                     ctx.fillStyle = `rgba(255, 255, 0, ${lifePct})`;
+                     ctx.beginPath(); ctx.arc(0, 0, 8 * scale, 0, Math.PI*2); ctx.fill();
+                 } else if (effect.type === 'BLOOD') {
+                     ctx.translate(effect.position.x, effect.position.y);
+                     ctx.fillStyle = `rgba(180, 0, 0, ${lifePct})`;
+                     ctx.beginPath(); ctx.arc(0, 0, 5 * scale, 0, Math.PI*2); ctx.fill();
+                 } else if (effect.type === 'HEAL') {
+                     ctx.translate(effect.position.x, effect.position.y);
+                     ctx.strokeStyle = `rgba(0, 255, 100, ${lifePct})`;
+                     ctx.lineWidth = 2;
+                     ctx.beginPath(); ctx.arc(0, 0, 10 + (1-lifePct)*10, 0, Math.PI*2); ctx.stroke();
+                 } else if (effect.type === 'BULLET' && effect.targetPosition) {
+                     ctx.strokeStyle = `rgba(255, 255, 150, ${lifePct})`;
+                     ctx.lineWidth = 1.5;
+                     ctx.beginPath();
+                     ctx.moveTo(effect.position.x, effect.position.y);
+                     ctx.lineTo(effect.targetPosition.x, effect.targetPosition.y);
+                     ctx.stroke();
+                 } else if (effect.type === 'HEAL_BEAM' && effect.targetPosition) {
+                     ctx.strokeStyle = `rgba(100, 255, 100, ${lifePct})`;
+                     ctx.lineWidth = 2;
+                     ctx.shadowBlur = 10;
+                     ctx.shadowColor = 'lime';
+                     ctx.beginPath();
+                     ctx.moveTo(effect.position.x, effect.position.y);
+                     ctx.lineTo(effect.targetPosition.x, effect.targetPosition.y);
+                     ctx.stroke();
+                     ctx.shadowBlur = 0;
+                 } else if (effect.type === 'SPARK') {
+                     ctx.translate(effect.position.x, effect.position.y);
+                     ctx.fillStyle = `rgba(255, 255, 255, ${lifePct})`;
+                     const s = 1 + Math.random() * 2;
+                     ctx.fillRect(-s/2, -s/2, s, s);
+                 }
+                 ctx.restore();
+            });
+
+            // Draw Selection Box
+            if (dragStart && mousePos) {
+                 const wx = mousePos.x + state.camera.x;
+                 const wy = mousePos.y + state.camera.y;
+                 const dx = dragStart.x + state.camera.x;
+                 const dy = dragStart.y + state.camera.y;
+                 
+                 ctx.strokeStyle = '#00ff00';
+                 ctx.lineWidth = 1;
+                 ctx.strokeRect(dx, dy, wx - dx, wy - dy);
+                 ctx.fillStyle = 'rgba(0, 255, 0, 0.1)';
+                 ctx.fillRect(dx, dy, wx - dx, wy - dy);
+            }
+            
+            // Draw Rally Points for selected buildings
+            state.selection.forEach(id => {
+                const ent = state.entities.get(id);
+                if (ent && ent.rallyPoint) {
+                    ctx.beginPath();
+                    ctx.moveTo(ent.position.x, ent.position.y);
+                    ctx.lineTo(ent.rallyPoint.x, ent.rallyPoint.y);
+                    ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+                    ctx.setLineDash([5, 5]);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                    
+                    ctx.fillStyle = '#fbbf24';
+                    ctx.beginPath(); ctx.arc(ent.rallyPoint.x, ent.rallyPoint.y, 3, 0, Math.PI*2); ctx.fill();
+                }
+            });
+
+            ctx.restore();
+        }
+
+        requestRef.current = requestAnimationFrame(loop);
+    }, [dragStart, mousePos, onGameStateUpdate, isMultiplayer, gameSeed, windowSize]);
+
+    useEffect(() => {
+        requestRef.current = requestAnimationFrame(loop);
+        return () => {
+            if (requestRef.current) cancelAnimationFrame(requestRef.current);
+        };
+    }, [loop]);
+
+    // Handle Network Messages
+    useEffect(() => {
+        if (!isMultiplayer) return;
+
+        const handleMsg = (msg: NetMessage) => {
+             if (msg.type === 'GAME_COMMAND' && stateRef.current) {
+                 const { action, data, owner } = msg.payload;
+                 const state = stateRef.current;
+                 
+                 if (action === 'TRAIN') {
+                     const building = state.entities.get(data.id);
+                     if (building && building.owner === owner) {
+                          if (state.resources[owner] >= STATS[data.type as EntityType].cost) {
+                              if (!building.trainQueue) building.trainQueue = [];
+                              building.trainQueue.push(data.type);
+                              state.resources[owner] -= STATS[data.type as EntityType].cost;
+                              playSound('train');
+                          }
+                     }
+                 }
+             }
+        };
+
+        const cleanup = network.subscribe(handleMsg);
+        return cleanup;
+    }, [isMultiplayer]);
+
+    // Handle Global Events (UI Commands)
+    useEffect(() => {
+        const handleCommand = (e: Event) => {
+            const detail = (e as CustomEvent).detail;
+            const state = stateRef.current;
+            if (!state) return;
+
+            const broadcast = (action: string, data: any) => {
+                if (isMultiplayer) {
+                    network.send({ type: 'GAME_COMMAND', payload: { action, data, owner: Owner.PLAYER } });
+                }
+            };
+
+            if (detail.action === 'TRAIN') {
+                const building = state.entities.get(detail.id);
+                if (building && building.owner === Owner.PLAYER) {
+                    const cost = STATS[detail.type as EntityType].cost;
+                    if (state.resources[Owner.PLAYER] >= cost) {
+                        state.resources[Owner.PLAYER] -= cost;
+                        if (!building.trainQueue) building.trainQueue = [];
+                        building.trainQueue.push(detail.type);
+                        playSound('train');
+                        broadcast('TRAIN', { id: detail.id, type: detail.type });
+                    } else {
+                        playSound('error');
+                    }
+                }
+            }
+            else if (detail.action === 'MOVE_CAMERA') {
+                 const maxCamX = Math.max(0, GAME_WIDTH - windowSize.width);
+                 const maxCamY = Math.max(0, GAME_HEIGHT - windowSize.height + 256); 
+                 state.camera.x = Math.max(0, Math.min(maxCamX, detail.x));
+                 state.camera.y = Math.max(0, Math.min(maxCamY, detail.y)); 
+            }
+            else if (detail.action === 'UNLOAD_ALL') {
+                 const bunker = state.entities.get(detail.id);
+                 if (bunker && bunker.garrison && bunker.garrison.length > 0) {
+                     bunker.garrison.forEach((uid, i) => {
+                         const unit = state.entities.get(uid);
+                         if (unit) {
+                             unit.state = 'IDLE';
+                             unit.containerId = null;
+                             const angle = (i * Math.PI) / 2;
+                             unit.position = {
+                                 x: bunker.position.x + Math.cos(angle) * 50,
+                                 y: bunker.position.y + Math.sin(angle) * 50
+                             };
+                         }
+                     });
+                     bunker.garrison = [];
+                     playSound('click');
+                 }
+            }
+            else if (detail.action === 'TOGGLE_PAUSE') {
+                state.paused = !state.paused;
+            }
+            else if (detail.action === 'RESTART') {
+                stateRef.current = initGame(detail.difficulty || difficulty, isMultiplayer, Math.random(), isHost, noRushSeconds);
+                if (terrainCanvasRef.current) terrainCanvasRef.current = renderTerrain();
+                onSelectionChange([] as GameEntity[]);
+            }
+            else if (detail.action === 'MINIMAP_ACTION') {
+                const targetPos = { x: detail.x, y: detail.y };
+                state.selection.forEach(id => {
+                    const ent = state.entities.get(id);
+                    if (ent && ent.owner === Owner.PLAYER) {
+                         if (STATS[ent.type].damage > 0) {
+                             ent.state = 'ATTACKING';
+                             ent.targetPosition = targetPos;
+                             ent.targetId = null;
+                             ent.rallyPoint = targetPos; 
+                             playSound('click');
+                         } else {
+                             ent.state = 'MOVING';
+                             ent.targetPosition = targetPos;
+                             ent.rallyPoint = targetPos;
+                             playSound('click');
+                         }
+                    }
+                });
+            }
+        };
+
+        window.addEventListener('GAME_COMMAND', handleCommand);
+        return () => window.removeEventListener('GAME_COMMAND', handleCommand);
+    }, [isMultiplayer, difficulty, isHost, noRushSeconds, windowSize]);
+
+    // Canvas Inputs
+    const handleMouseDown = (e: React.MouseEvent) => {
+        if (!stateRef.current) return;
+        const rect = canvasRef.current!.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        const worldX = x + stateRef.current.camera.x;
+        const worldY = y + stateRef.current.camera.y;
+
+        if (e.button === 0) {
+            // Left Click
+            if (commandMode) {
+                const typeStr = commandMode.replace('BUILD_', '');
+                const type = typeStr as EntityType;
+                const workerId = stateRef.current.selection.find(id => {
+                     const ent = stateRef.current!.entities.get(id);
+                     return ent && ent.type === EntityType.WORKER && ent.owner === Owner.PLAYER;
+                });
+                
+                if (workerId) {
+                    const worker = stateRef.current.entities.get(workerId);
+                    if (worker) {
+                         const cost = STATS[type].cost;
+                         if (stateRef.current.resources[Owner.PLAYER] >= cost) {
+                             let valid = true;
+                             if (worldX < 50 || worldX > GAME_WIDTH-50 || worldY < 50 || worldY > GAME_HEIGHT-50) valid = false;
+                             if (valid) {
+                                 stateRef.current.resources[Owner.PLAYER] -= cost;
+                                 const b = createEntity(type, Owner.PLAYER, { x: worldX, y: worldY });
+                                 b.constructionProgress = 0;
+                                 stateRef.current.entities.set(b.id, b);
+                                 worker.state = 'BUILDING';
+                                 worker.targetId = b.id;
+                                 playSound('build');
+                                 setCommandMode(null);
+                             } else {
+                                 playSound('error');
+                             }
+                         } else {
+                             playSound('error');
+                         }
+                    }
+                }
+            } else {
+                setDragStart({ x, y });
+            }
+        } else if (e.button === 2) {
+            setCommandMode(null);
+            e.preventDefault();
+            
+            let targetId: string | null = null;
+            // Fix: Explicitly cast Array.from result to GameEntity[] to ensure ent properties are available
+            const entities = Array.from(stateRef.current.entities.values()) as GameEntity[];
+            for (let i = entities.length - 1; i >= 0; i--) {
+                const ent = entities[i];
+                if (ent.state === 'GARRISONED') continue;
+                const dist = Math.sqrt(Math.pow(ent.position.x - worldX, 2) + Math.pow(ent.position.y - worldY, 2));
+                if (dist < ent.radius + 5) {
+                    targetId = ent.id;
+                    break;
+                }
+            }
+
+            stateRef.current.selection.forEach(id => {
+                const ent = stateRef.current!.entities.get(id);
+                if (ent && ent.owner === Owner.PLAYER) {
+                    if (STATS[ent.type].speed === 0) {
+                        ent.rallyPoint = { x: worldX, y: worldY };
+                        ent.rallyTargetId = targetId;
+                        playSound('click');
+                        return;
+                    }
+
+                    if (targetId) {
+                        const target = stateRef.current!.entities.get(targetId);
+                        if (target) {
+                            if (target.owner === Owner.NEUTRAL && target.type === EntityType.MINERAL && ent.type === EntityType.WORKER) {
+                                ent.state = 'GATHERING';
+                                ent.targetId = target.id;
+                                playSound('click');
+                            } else if (target.owner !== Owner.PLAYER && target.owner !== Owner.NEUTRAL) {
+                                ent.state = 'ATTACKING';
+                                ent.targetId = target.id;
+                                playSound('click');
+                            } else if (target.type === EntityType.BUNKER && target.owner === Owner.PLAYER && ent.type !== EntityType.WORKER) {
+                                ent.state = 'ENTERING';
+                                ent.targetId = target.id;
+                                playSound('click');
+                            } else if (target.type === EntityType.MEDIC && target.owner === Owner.PLAYER) {
+                                ent.state = 'MOVING';
+                                ent.targetPosition = { x: worldX, y: worldY };
+                                playSound('click');
+                            } else {
+                                ent.state = 'MOVING';
+                                ent.targetPosition = { x: worldX, y: worldY };
+                                ent.targetId = null; 
+                                playSound('click');
+                            }
+                        }
+                    } else {
+                        ent.state = 'MOVING';
+                        ent.targetPosition = { x: worldX, y: worldY };
+                        ent.targetId = null;
+                        playSound('click');
+                    }
+                }
+            });
+        }
+    };
+
+    const handleMouseUp = (e: React.MouseEvent) => {
+        if (!stateRef.current || !dragStart) {
+            setDragStart(null);
+            return;
+        }
+
+        if (e.button === 0 && !commandMode) {
+            const rect = canvasRef.current!.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+            
+            const dx = Math.abs(x - dragStart.x);
+            const dy = Math.abs(y - dragStart.y);
+            
+            const newSelection: string[] = [];
+            const isBox = dx > 5 || dy > 5;
+            
+            const wx1 = Math.min(x, dragStart.x) + stateRef.current.camera.x;
+            const wy1 = Math.min(y, dragStart.y) + stateRef.current.camera.y;
+            const wx2 = Math.max(x, dragStart.x) + stateRef.current.camera.x;
+            const wy2 = Math.max(y, dragStart.y) + stateRef.current.camera.y;
+
+            stateRef.current.entities.forEach((ent: GameEntity) => {
+                 if (ent.owner !== Owner.PLAYER) return; 
+                 if (ent.state === 'GARRISONED') return;
+                 
+                 if (isBox) {
+                     if (ent.position.x >= wx1 && ent.position.x <= wx2 && ent.position.y >= wy1 && ent.position.y <= wy2) {
+                         newSelection.push(ent.id);
+                     }
+                 } else {
+                     const dist = Math.sqrt(Math.pow(ent.position.x - (x + stateRef.current.camera.x), 2) + Math.pow(ent.position.y - (y + stateRef.current.camera.y), 2));
+                     if (dist < ent.radius + 10) {
+                         newSelection.push(ent.id);
+                     }
+                 }
+            });
+            
+            if (!isBox && newSelection.length === 0) {
+                 const worldX = x + stateRef.current.camera.x;
+                 const worldY = y + stateRef.current.camera.y;
+                 let found: GameEntity | null = null;
+                 // Fix: Explicitly cast Array.from result to GameEntity[] to ensure ent properties (state, position, radius, id) are correctly typed
+                 const allEnts = Array.from(stateRef.current.entities.values()) as GameEntity[];
+                 allEnts.forEach((ent: GameEntity) => {
+                     if (ent.state === 'GARRISONED') return;
+                     const dist = Math.sqrt(Math.pow(ent.position.x - worldX, 2) + Math.pow(ent.position.y - worldY, 2));
+                     if (dist < ent.radius + 10) found = ent;
+                 });
+                 if (found) newSelection.push(found.id);
+            }
+
+            stateRef.current.selection = newSelection;
+            onSelectionChange(newSelection.map(id => stateRef.current!.entities.get(id)!).filter(Boolean));
+        }
+        setDragStart(null);
+    };
+
+    const handleMouseMove = (e: React.MouseEvent) => {
+        const rect = canvasRef.current!.getBoundingClientRect();
+        setMousePos({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+    };
+
+    return (
+        <canvas
+            ref={canvasRef}
+            width={window.innerWidth}
+            height={window.innerHeight}
+            onMouseDown={handleMouseDown}
+            onMouseUp={handleMouseUp}
+            onMouseMove={handleMouseMove}
+            onContextMenu={(e) => e.preventDefault()}
+            className={`block cursor-${commandMode ? 'crosshair' : 'default'}`}
+        />
+    );
 };
