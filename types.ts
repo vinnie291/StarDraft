@@ -38,7 +38,7 @@ export interface Vector2 {
 
 export interface Effect {
   id: string;
-  type: 'EXPLOSION' | 'BLOOD' | 'BUILDING_EXPLOSION' | 'HEAL' | 'BULLET' | 'HEAL_BEAM' | 'SPARK';
+  type: 'EXPLOSION' | 'BLOOD' | 'BUILDING_EXPLOSION' | 'HEAL' | 'BULLET' | 'HEAL_BEAM' | 'SPARK' | 'WAYPOINT';
   position: Vector2;
   targetPosition?: Vector2; // Added for lines like bullets and beams
   life: number;
@@ -81,6 +81,7 @@ export interface GameEntity {
   lastAttackerId?: string | null; // For retaliation
   garrison?: string[]; // IDs of units inside (for Bunker)
   containerId?: string | null; // ID of entity this unit is inside
+  unitsTrained?: number; // Counter for deterministic ID generation
 }
 
 export interface GameState {
@@ -133,7 +134,8 @@ export type NetMessage =
   | { type: 'WELCOME', payload: { seed: number, hostId: string } }
   | { type: 'READY', payload: { id: string, ready: boolean } }
   | { type: 'START_GAME', payload: { seed: number, noRushSeconds: number } }
-  | { type: 'GAME_COMMAND', payload: { action: string, data: any, owner: Owner } }
+  | { type: 'GAME_COMMAND', payload: { action: string, data: any } }
+  | { type: 'SYNC_STATE', payload: any }
   | { type: 'ERROR', payload: { message: string } };
 
 export interface PlayerInfo {

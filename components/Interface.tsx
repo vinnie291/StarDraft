@@ -31,19 +31,37 @@ export const Interface: React.FC<Props> = ({ gameState, selectedEntities, onComm
         const key = e.key.toUpperCase();
         if ((e.target as HTMLElement).tagName === 'INPUT') return;
 
+        const checkRes = (type: EntityType) => {
+            const stats = STATS[type];
+            const isResBlocked = resources < stats.cost;
+            let isSupplyBlocked = false;
+            if (stats.supplyCost) {
+                isSupplyBlocked = supply.used + stats.supplyCost > supply.max;
+            }
+            if (isResBlocked) {
+                window.dispatchEvent(new CustomEvent('GAME_COMMAND', { detail: { action: 'NOTIFY', text: 'Not enough minerals' } }));
+                return false;
+            }
+            if (isSupplyBlocked) {
+                window.dispatchEvent(new CustomEvent('GAME_COMMAND', { detail: { action: 'NOTIFY', text: 'Build more supply depots' } }));
+                return false;
+            }
+            return true;
+        };
+
         if (singleSelection?.type === EntityType.BASE) {
-            if (key === 'W') onTrain(EntityType.WORKER);
+            if (key === 'W' && checkRes(EntityType.WORKER)) onTrain(EntityType.WORKER);
         }
         
         if (showBarracksMenu) {
-            if (key === 'M') handleMultiTrain(EntityType.MARINE);
-            if (key === 'E') handleMultiTrain(EntityType.MEDIC);
+            if (key === 'M' && checkRes(EntityType.MARINE)) handleMultiTrain(EntityType.MARINE);
+            if (key === 'E' && checkRes(EntityType.MEDIC)) handleMultiTrain(EntityType.MEDIC);
         }
         
         if (singleSelection?.type === EntityType.WORKER) {
-            if (key === 'B') onCommand(`BUILD_${EntityType.BARRACKS}`);
-            if (key === 'S') onCommand(`BUILD_${EntityType.SUPPLY_DEPOT}`);
-            if (key === 'U') onCommand(`BUILD_${EntityType.BUNKER}`);
+            if (key === 'B' && checkRes(EntityType.BARRACKS)) onCommand(`BUILD_${EntityType.BARRACKS}`);
+            if (key === 'S' && checkRes(EntityType.SUPPLY_DEPOT)) onCommand(`BUILD_${EntityType.SUPPLY_DEPOT}`);
+            if (key === 'U' && checkRes(EntityType.BUNKER)) onCommand(`BUILD_${EntityType.BUNKER}`);
         }
 
         if (singleSelection?.type === EntityType.BUNKER && singleSelection.owner === Owner.PLAYER) {
@@ -159,7 +177,10 @@ export const Interface: React.FC<Props> = ({ gameState, selectedEntities, onComm
 
   const isVisibleOnMinimap = (entity: GameEntity, playerUnits: GameEntity[]) => {
       if (entity.owner === Owner.PLAYER) return true;
-      if (entity.type === EntityType.MINERAL && entity.resourceAmount! <= 0) return false;
+      if (entity.owner === Owner.NEUTRAL) {
+          if (entity.type === EntityType.MINERAL && entity.resourceAmount! <= 0) return false;
+          return true;
+      }
       for(const pu of playerUnits) {
           const dx = entity.position.x - pu.position.x;
           const dy = entity.position.y - pu.position.y;
@@ -400,6 +421,7 @@ export const Interface: React.FC<Props> = ({ gameState, selectedEntities, onComm
               {singleSelection?.type === EntityType.BASE && (
                   <CommandButton 
                       label="Worker" sub="50" hotkey="W" cost={50} res={resources} 
+                      supplyCost={STATS[EntityType.WORKER].supplyCost} supply={supply}
                       onClick={() => onTrain(EntityType.WORKER)} 
                       progress={singleSelection.trainProgress} max={STATS[EntityType.WORKER].buildTime} queue={singleSelection.trainQueue?.length || 0}
                   />
@@ -408,11 +430,13 @@ export const Interface: React.FC<Props> = ({ gameState, selectedEntities, onComm
                   <>
                   <CommandButton 
                       label="Marine" sub="50" hotkey="M" cost={50} res={resources} 
+                      supplyCost={STATS[EntityType.MARINE].supplyCost} supply={supply}
                       onClick={() => handleMultiTrain(EntityType.MARINE)} 
                       progress={singleSelection ? singleSelection.trainProgress : 0} max={STATS[EntityType.MARINE].buildTime} queue={singleSelection ? singleSelection.trainQueue?.length : 0}
                   />
                   <CommandButton 
                       label="Medic" sub="75" hotkey="E" cost={75} res={resources} 
+                      supplyCost={STATS[EntityType.MEDIC].supplyCost} supply={supply}
                       onClick={() => handleMultiTrain(EntityType.MEDIC)} 
                       progress={singleSelection ? singleSelection.trainProgress : 0} max={STATS[EntityType.MEDIC].buildTime} queue={singleSelection ? singleSelection.trainQueue?.length : 0}
                   />
@@ -434,12 +458,26 @@ export const Interface: React.FC<Props> = ({ gameState, selectedEntities, onComm
   );
 };
 
-const CommandButton = ({ label, sub, hotkey, cost, res, onClick, progress, max, queue }: any) => {
-    const disabled = res < cost;
+const CommandButton = ({ label, sub, hotkey, cost, res, supplyCost, supply, onClick, progress, max, queue }: any) => {
+    // Calculate queued supply if needed (we don't have building queue here easily, so we just check max)
+    // Actually, we can just check if supply + supplyCost > max
+    const isSupplyBlocked = supplyCost && supply && (supply.used + supplyCost > supply.max);
+    const isResBlocked = res < cost;
+    const disabled = isResBlocked || isSupplyBlocked;
+    
+    const handleClick = () => {
+        if (isResBlocked) {
+            window.dispatchEvent(new CustomEvent('GAME_COMMAND', { detail: { action: 'NOTIFY', text: 'Not enough minerals' } }));
+        } else if (isSupplyBlocked) {
+            window.dispatchEvent(new CustomEvent('GAME_COMMAND', { detail: { action: 'NOTIFY', text: 'Build more supply depots' } }));
+        } else {
+            onClick();
+        }
+    };
+
     return (
         <button 
-            disabled={disabled}
-            onClick={onClick}
+            onClick={handleClick}
             className={`
                 relative rounded-lg flex flex-col items-center justify-center p-1 transition-all duration-100 group
                 ${disabled 

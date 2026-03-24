@@ -7,11 +7,16 @@ let idCounter = 0;
 export const generateId = (prefix: string = 'ent') => `${prefix}_${++idCounter}_${Math.floor(Math.random()*1000)}`;
 
 export const addNotification = (state: GameState, text: string) => {
-    state.notifications.push({
-        id: `n_${Math.random()}`,
-        text,
-        life: 120
-    });
+    const existing = state.notifications.find(n => n.text === text);
+    if (existing) {
+        existing.life = 120;
+    } else {
+        state.notifications.push({
+            id: `n_${Math.random()}`,
+            text,
+            life: 120
+        });
+    }
 };
 
 export const createEntity = (type: EntityType, owner: Owner, pos: Vector2, id?: string): GameEntity => {
@@ -38,7 +43,8 @@ export const createEntity = (type: EntityType, owner: Owner, pos: Vector2, id?: 
     rallyTargetId: null,
     lastAttackerId: null,
     garrison: [],
-    containerId: null
+    containerId: null,
+    unitsTrained: 0
   };
 };
 
@@ -148,11 +154,24 @@ export const initGame = (difficulty: Difficulty = Difficulty.MEDIUM, isMultiplay
   }
 
   const spawnBase = (pos: Vector2, owner: Owner) => {
-      const centerAngle = Math.atan2((GAME_HEIGHT/2) - pos.y, (GAME_WIDTH/2) - pos.x);
-      for (let i = 0; i < 8; i++) {
-        const angle = centerAngle - (Math.PI/2) + (i / 7) * Math.PI; 
-        add(createEntity(EntityType.MINERAL, Owner.NEUTRAL, { x: pos.x + 220 * Math.cos(angle), y: pos.y + 220 * Math.sin(angle) }));
+      const isLeft = pos.x < GAME_WIDTH / 2;
+      const isTop = pos.y < GAME_HEIGHT / 2;
+      
+      const minX = isLeft ? pos.x - 100 : pos.x + 100;
+      const minY = isTop ? pos.y - 100 : pos.y + 100;
+      
+      const dirX = isLeft ? 1 : -1;
+      const dirY = isTop ? 1 : -1;
+
+      // 4 minerals along the vertical arm of the L
+      for (let i = 0; i < 4; i++) {
+          add(createEntity(EntityType.MINERAL, Owner.NEUTRAL, { x: minX, y: minY + i * 40 * dirY }));
       }
+      // 4 minerals along the horizontal arm of the L
+      for (let i = 1; i <= 4; i++) {
+          add(createEntity(EntityType.MINERAL, Owner.NEUTRAL, { x: minX + i * 40 * dirX, y: minY }));
+      }
+
       const base = createEntity(EntityType.BASE, owner, pos);
       add(base);
       for (let i = 0; i < 4; i++) {
@@ -277,13 +296,40 @@ export const updateGame = (state: GameState): GameState => {
     if (entity.type === EntityType.MOUNTAIN || entity.type === EntityType.WATER) return; 
     if (entity.state === 'GARRISONED') return; 
 
+    if (entity.hp <= 0) {
+        let effectType: Effect['type'] = 'EXPLOSION';
+        let effectScale = entity.radius / 10;
+        if (isBio(entity.type)) effectType = 'BLOOD';
+        else if (isBuilding(entity.type)) { effectType = 'BUILDING_EXPLOSION'; effectScale = 2.0; }
+
+        newEffects.push({
+            id: `fx_${Math.random()}`,
+            type: effectType,
+            position: { ...entity.position },
+            life: effectType === 'BUILDING_EXPLOSION' ? 60 : 30,
+            maxLife: effectType === 'BUILDING_EXPLOSION' ? 60 : 30,
+            scale: effectScale
+        });
+        soundEvents.push('explosion');
+        if (entity.garrison) {
+            entity.garrison.forEach(id => {
+                const unit = newEntities.get(id);
+                if (unit) {
+                    unit.state = 'IDLE';
+                    unit.containerId = null;
+                    unit.position = { x: entity.position.x + (Math.random() * 40 - 20), y: entity.position.y + (Math.random() * 40 - 20) };
+                }
+            });
+        }
+        newEntities.delete(entity.id);
+        return;
+    }
+
     // Global Cooldown Decrement
     if (entity.cooldown > 0) entity.cooldown--;
 
-    // Construction
-    if (entity.constructionProgress! < 100) {
-       entity.constructionProgress! += (100 / STATS[entity.type].buildTime);
-       if (entity.constructionProgress! >= 100) entity.constructionProgress = 100;
+    // Under Construction
+    if (entity.constructionProgress !== undefined && entity.constructionProgress < 100) {
        return; 
     }
 
@@ -296,10 +342,12 @@ export const updateGame = (state: GameState): GameState => {
           if (supply[entity.owner].used + stats.supplyCost <= supply[entity.owner].max) {
              const spawnDir = entity.owner === Owner.PLAYER ? -1 : 1;
              const offset = 80; 
+             entity.unitsTrained = (entity.unitsTrained || 0) + 1;
+             const newUnitId = `${entity.id}_u${entity.unitsTrained}`;
              const newUnit = createEntity(unitType, entity.owner, { 
                 x: entity.position.x + (Math.random() * 40 - 20), 
                 y: entity.position.y + (offset * spawnDir) + (Math.random() * 10) 
-             });
+             }, newUnitId);
              
              if (entity.rallyPoint) {
                  if (newUnit.type === EntityType.WORKER && entity.rallyTargetId) {
@@ -594,6 +642,46 @@ export const updateGame = (state: GameState): GameState => {
         }
     }
 
+    if (entity.state === 'BUILDING') {
+        const target = entity.targetId ? entities.get(entity.targetId) : null;
+        if (!target || target.hp <= 0 || target.constructionProgress! >= 100) {
+            entity.state = 'IDLE';
+            entity.targetId = null;
+        } else {
+            const dist = getDistance(entity.position, target.position);
+            const reach = target.radius + entity.radius + 5;
+            if (dist <= reach) {
+                // Circle around the building
+                const angle = Math.atan2(entity.position.y - target.position.y, entity.position.x - target.position.x);
+                const newAngle = angle + 0.05;
+                entity.position.x = target.position.x + Math.cos(newAngle) * reach;
+                entity.position.y = target.position.y + Math.sin(newAngle) * reach;
+                
+                // Progress the building
+                target.constructionProgress! += (100 / STATS[target.type].buildTime);
+                if (target.constructionProgress! >= 100) {
+                    target.constructionProgress = 100;
+                    entity.state = 'IDLE';
+                    entity.targetId = null;
+                }
+                
+                // Sparks
+                if (state.gameTime % 5 === 0) {
+                    newEffects.push({
+                        id: `spark_${Math.random()}`,
+                        type: 'SPARK',
+                        position: { ...entity.position },
+                        life: 10, maxLife: 10, scale: 0.5 + Math.random()
+                    });
+                }
+            } else {
+                const angle = Math.atan2(target.position.y - entity.position.y, target.position.x - entity.position.x);
+                entity.position.x += Math.cos(angle) * stats.speed;
+                entity.position.y += Math.sin(angle) * stats.speed;
+            }
+        }
+    }
+
     if (entity.state === 'RETURNING') {
         const base = entity.targetId ? entities.get(entity.targetId) : null;
         if (!base || base.hp <= 0) {
@@ -615,34 +703,6 @@ export const updateGame = (state: GameState): GameState => {
                 entity.position.y += Math.sin(angle) * stats.speed;
             }
         }
-    }
-
-    if (entity.hp <= 0) {
-        let effectType: Effect['type'] = 'EXPLOSION';
-        let effectScale = entity.radius / 10;
-        if (isBio(entity.type)) effectType = 'BLOOD';
-        else if (isBuilding(entity.type)) { effectType = 'BUILDING_EXPLOSION'; effectScale = 2.0; }
-
-        newEffects.push({
-            id: `fx_${Math.random()}`,
-            type: effectType,
-            position: { ...entity.position },
-            life: effectType === 'BUILDING_EXPLOSION' ? 60 : 30,
-            maxLife: effectType === 'BUILDING_EXPLOSION' ? 60 : 30,
-            scale: effectScale
-        });
-        soundEvents.push('explosion');
-        if (entity.garrison) {
-            entity.garrison.forEach(id => {
-                const unit = newEntities.get(id);
-                if (unit) {
-                    unit.state = 'IDLE';
-                    unit.containerId = null;
-                    unit.position = { x: entity.position.x + (Math.random() * 40 - 20), y: entity.position.y + (Math.random() * 40 - 20) };
-                }
-            });
-        }
-        newEntities.delete(entity.id);
     }
     resolveCollisions(entity, entities);
   });
