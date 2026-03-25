@@ -131,11 +131,78 @@ export const initGame = (difficulty: Difficulty = Difficulty.MEDIUM, isMultiplay
       }
   };
 
-  for(let i=0; i<15; i++) {
-      generateCluster(EntityType.MOUNTAIN, 5, rng.range(0, GAME_WIDTH), rng.range(0, GAME_HEIGHT), 150);
-  }
-  for(let i=0; i<8; i++) {
-      generateCluster(EntityType.WATER, 4, rng.range(0, GAME_WIDTH), rng.range(0, GAME_HEIGHT), 120);
+  const generateBlock = (type: EntityType, startX: number, startY: number, endX: number, endY: number, density: number = 50) => {
+      for (let x = startX; x <= endX; x += density) {
+          for (let y = startY; y <= endY; y += density) {
+              const jx = x + (rng.next() - 0.5) * 20;
+              const jy = y + (rng.next() - 0.5) * 20;
+              if (getDistance({x: jx, y: jy}, myBasePos) < 400) continue;
+              if (getDistance({x: jx, y: jy}, opBasePos) < 400) continue;
+              if (jx < 50 || jx > GAME_WIDTH-50 || jy < 50 || jy > GAME_HEIGHT-50) continue;
+              add(createEntity(type, Owner.NEUTRAL, {x: jx, y: jy}));
+          }
+      }
+  };
+
+  const mapType = Math.floor(rng.next() * 5); // 0 to 4
+
+  if (mapType === 0) {
+      // Map 0: Classic Random
+      for(let i=0; i<15; i++) {
+          generateCluster(EntityType.MOUNTAIN, 5, rng.range(0, GAME_WIDTH), rng.range(0, GAME_HEIGHT), 150);
+      }
+      for(let i=0; i<8; i++) {
+          generateCluster(EntityType.WATER, 4, rng.range(0, GAME_WIDTH), rng.range(0, GAME_HEIGHT), 120);
+      }
+  } else if (mapType === 1) {
+      // Map 1: Four Lakes (Cross landbridge)
+      generateBlock(EntityType.WATER, 100, 100, GAME_WIDTH/2 - 200, GAME_HEIGHT/2 - 200);
+      generateBlock(EntityType.WATER, GAME_WIDTH/2 + 200, 100, GAME_WIDTH - 100, GAME_HEIGHT/2 - 200);
+      generateBlock(EntityType.WATER, 100, GAME_HEIGHT/2 + 200, GAME_WIDTH/2 - 200, GAME_HEIGHT - 100);
+      generateBlock(EntityType.WATER, GAME_WIDTH/2 + 200, GAME_HEIGHT/2 + 200, GAME_WIDTH - 100, GAME_HEIGHT - 100);
+      for(let i=0; i<8; i++) {
+          generateCluster(EntityType.MOUNTAIN, 4, rng.range(0, GAME_WIDTH), rng.range(0, GAME_HEIGHT), 100);
+      }
+  } else if (mapType === 2) {
+      // Map 2: River Divide (Horizontal river with 3 bridges)
+      for (let x = 50; x <= GAME_WIDTH - 50; x += 50) {
+          for (let y = GAME_HEIGHT/2 - 150; y <= GAME_HEIGHT/2 + 150; y += 50) {
+              if (Math.abs(x - 300) < 150 || Math.abs(x - GAME_WIDTH/2) < 150 || Math.abs(x - (GAME_WIDTH - 300)) < 150) continue;
+              const jx = x + (rng.next() - 0.5) * 20;
+              const jy = y + (rng.next() - 0.5) * 20;
+              if (getDistance({x: jx, y: jy}, myBasePos) < 400) continue;
+              if (getDistance({x: jx, y: jy}, opBasePos) < 400) continue;
+              add(createEntity(EntityType.WATER, Owner.NEUTRAL, {x: jx, y: jy}));
+          }
+      }
+      for(let i=0; i<10; i++) {
+          generateCluster(EntityType.MOUNTAIN, 4, rng.range(0, GAME_WIDTH), rng.range(0, GAME_HEIGHT), 120);
+      }
+  } else if (mapType === 3) {
+      // Map 3: Central Lake (Ring map)
+      const centerX = GAME_WIDTH / 2;
+      const centerY = GAME_HEIGHT / 2;
+      for (let x = centerX - 500; x <= centerX + 500; x += 50) {
+          for (let y = centerY - 500; y <= centerY + 500; y += 50) {
+              if (getDistance({x, y}, {x: centerX, y: centerY}) < 500) {
+                  const jx = x + (rng.next() - 0.5) * 20;
+                  const jy = y + (rng.next() - 0.5) * 20;
+                  if (getDistance({x: jx, y: jy}, myBasePos) < 400) continue;
+                  if (getDistance({x: jx, y: jy}, opBasePos) < 400) continue;
+                  add(createEntity(EntityType.WATER, Owner.NEUTRAL, {x: jx, y: jy}));
+              }
+          }
+      }
+      for(let i=0; i<12; i++) {
+          generateCluster(EntityType.MOUNTAIN, 3, rng.range(0, GAME_WIDTH), rng.range(0, GAME_HEIGHT), 100);
+      }
+  } else if (mapType === 4) {
+      // Map 4: Twin Ponds (Two large lakes, central bridge, side bridges)
+      generateBlock(EntityType.WATER, 200, GAME_HEIGHT/2 - 400, GAME_WIDTH/2 - 200, GAME_HEIGHT/2 + 400);
+      generateBlock(EntityType.WATER, GAME_WIDTH/2 + 200, GAME_HEIGHT/2 - 400, GAME_WIDTH - 200, GAME_HEIGHT/2 + 400);
+      for(let i=0; i<10; i++) {
+          generateCluster(EntityType.MOUNTAIN, 4, rng.range(0, GAME_WIDTH), rng.range(0, GAME_HEIGHT), 100);
+      }
   }
 
   const possibleExpansions = [2, 4, 6, 8];
@@ -266,6 +333,40 @@ const acquireTarget = (entity: GameEntity, entities: Map<string, GameEntity>, ga
         }
     });
     return bestTarget;
+};
+
+export const isValidBuildingLocation = (entities: Map<string, GameEntity>, type: EntityType, pos: Vector2): boolean => {
+    if (pos.x < 50 || pos.x > GAME_WIDTH - 50 || pos.y < 50 || pos.y > GAME_HEIGHT - 50) return false;
+    
+    const stats = STATS[type];
+    const buildRadius = Math.max(stats.width, stats.height) / 2;
+    
+    for (const e of entities.values()) {
+        if (e.type === EntityType.MINERAL || STATS[e.type].speed === 0) {
+            const dist = Math.hypot(e.position.x - pos.x, e.position.y - pos.y);
+            const minDistance = e.radius + buildRadius + 20; // 20px spacing
+            if (dist < minDistance) {
+                return false;
+            }
+        }
+    }
+    return true;
+};
+
+export const findValidBuildingLocation = (entities: Map<string, GameEntity>, type: EntityType, startPos: Vector2): Vector2 | null => {
+    // Try expanding circles around startPos
+    for (let radius = 50; radius <= 500; radius += 50) {
+        for (let angle = 0; angle < Math.PI * 2; angle += Math.PI / 4) {
+            const testPos = {
+                x: startPos.x + Math.cos(angle) * radius,
+                y: startPos.y + Math.sin(angle) * radius
+            };
+            if (isValidBuildingLocation(entities, type, testPos)) {
+                return testPos;
+            }
+        }
+    }
+    return null;
 };
 
 export const updateGame = (state: GameState): GameState => {
@@ -494,6 +595,34 @@ export const updateGame = (state: GameState): GameState => {
             entity.targetId = target.id;
             entity.state = 'ATTACKING';
         }
+    }
+
+    // Worker Auto-Gather when IDLE for 7 seconds (approx 420 frames at 60fps)
+    if (entity.state === 'IDLE') {
+        entity.idleTimer = (entity.idleTimer || 0) + 1;
+        if (entity.type === EntityType.WORKER && entity.idleTimer > 420) {
+            let nearestMineral: GameEntity | null = null;
+            let minDist = Infinity;
+            entities.forEach(m => {
+                if (m.type === EntityType.MINERAL && m.resourceAmount! > 0) {
+                    const dist = getDistance(entity.position, m.position);
+                    if (dist < minDist) {
+                        minDist = dist;
+                        nearestMineral = m;
+                    }
+                }
+            });
+            if (nearestMineral) {
+                entity.targetId = (nearestMineral as GameEntity).id;
+                entity.state = 'GATHERING';
+                entity.idleTimer = 0;
+            } else {
+                // If no minerals found, wait another 3 seconds before checking again
+                entity.idleTimer = 420 - 180; 
+            }
+        }
+    } else {
+        entity.idleTimer = 0;
     }
 
     if (entity.state === 'MOVING' && entity.targetPosition) {
@@ -772,9 +901,12 @@ const runAI = (state: GameState, entities: Map<string, GameEntity>, resources: a
   if (supply[aiOwner].max - supply[aiOwner].used <= 3 && resources[aiOwner] >= 100) {
       const builder = workers.find(w => w.state === 'GATHERING' || w.state === 'IDLE');
       if (builder) {
-          resources[aiOwner] -= 100;
-          const depot = createEntity(EntityType.SUPPLY_DEPOT, aiOwner, { x: builder.position.x + 100, y: builder.position.y });
-          entities.set(depot.id, depot);
+          const pos = findValidBuildingLocation(entities, EntityType.SUPPLY_DEPOT, builder.position);
+          if (pos) {
+              resources[aiOwner] -= 100;
+              const depot = createEntity(EntityType.SUPPLY_DEPOT, aiOwner, pos);
+              entities.set(depot.id, depot);
+          }
       }
   }
 
@@ -782,9 +914,12 @@ const runAI = (state: GameState, entities: Map<string, GameEntity>, resources: a
   if (barracks.length < 3 && resources[aiOwner] >= 150) {
       const builder = workers.find(w => w.state === 'GATHERING');
       if (builder) {
-           resources[aiOwner] -= 150;
-           const b = createEntity(EntityType.BARRACKS, aiOwner, { x: builder.position.x - 100, y: builder.position.y });
-           entities.set(b.id, b);
+           const pos = findValidBuildingLocation(entities, EntityType.BARRACKS, builder.position);
+           if (pos) {
+               resources[aiOwner] -= 150;
+               const b = createEntity(EntityType.BARRACKS, aiOwner, pos);
+               entities.set(b.id, b);
+           }
       }
   }
 

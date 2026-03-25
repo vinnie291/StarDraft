@@ -82,6 +82,7 @@ export interface GameEntity {
   garrison?: string[]; // IDs of units inside (for Bunker)
   containerId?: string | null; // ID of entity this unit is inside
   unitsTrained?: number; // Counter for deterministic ID generation
+  idleTimer?: number; // Frames spent in IDLE state
 }
 
 export interface GameState {

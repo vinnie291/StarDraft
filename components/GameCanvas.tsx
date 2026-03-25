@@ -2,7 +2,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { GameState, GameEntity, EntityType, Owner, Vector2, Marker, Difficulty, NetMessage } from '../types';
 import { STATS, GAME_WIDTH, GAME_HEIGHT, UI_TOP_HEIGHT } from '../constants';
-import { updateGame, initGame, createEntity, addNotification } from '../services/gameLogic';
+import { updateGame, initGame, createEntity, addNotification, isValidBuildingLocation } from '../services/gameLogic';
 import { playSound } from '../services/audio';
 import { network } from '../services/network';
 
@@ -387,14 +387,9 @@ export const GameCanvas: React.FC<Props> = ({
             const { workerId, type, x, y, entityId } = data;
             const worker = state.entities.get(workerId);
             if (worker && worker.owner === owner) {
-                if (worker.state === 'BUILDING') {
-                    if (owner === Owner.PLAYER) playSound('error');
-                    return;
-                }
                 const cost = STATS[type as EntityType].cost;
                 if (state.resources[owner] >= cost) {
-                    let valid = true;
-                    if (x < 50 || x > GAME_WIDTH-50 || y < 50 || y > GAME_HEIGHT-50) valid = false;
+                    const valid = isValidBuildingLocation(state.entities, type as EntityType, { x, y });
                     if (valid) {
                         state.resources[owner] -= cost;
                         const b = createEntity(type as EntityType, owner, { x, y }, entityId);
@@ -449,6 +444,10 @@ export const GameCanvas: React.FC<Props> = ({
                                 if (owner === Owner.PLAYER) playSound('click');
                             } else if (target.owner !== owner && target.owner !== Owner.NEUTRAL) {
                                 ent.state = 'ATTACKING';
+                                ent.targetId = target.id;
+                                if (owner === Owner.PLAYER) playSound('click');
+                            } else if (target.owner === owner && target.constructionProgress !== undefined && target.constructionProgress < 100 && ent.type === EntityType.WORKER) {
+                                ent.state = 'BUILDING';
                                 ent.targetId = target.id;
                                 if (owner === Owner.PLAYER) playSound('click');
                             } else if (target.type === EntityType.BUNKER && target.owner === owner && ent.type !== EntityType.WORKER) {
@@ -912,15 +911,14 @@ export const GameCanvas: React.FC<Props> = ({
                 const worldX = mousePos.x + state.camera.x;
                 const worldY = mousePos.y + state.camera.y;
                 
-                let valid = true;
-                if (worldX < 50 || worldX > GAME_WIDTH-50 || worldY < 50 || worldY > GAME_HEIGHT-50) valid = false;
+                const valid = isValidBuildingLocation(state.entities, type, { x: worldX, y: worldY });
                 
                 const ghostEntity: GameEntity = {
                     id: 'ghost',
                     type: type,
                     owner: Owner.PLAYER,
                     position: { x: worldX, y: worldY },
-                    radius: STATS[type].radius,
+                    radius: Math.max(STATS[type].width, STATS[type].height) / 2,
                     hp: 100,
                     maxHp: 100,
                     targetId: null,
@@ -1057,6 +1055,30 @@ export const GameCanvas: React.FC<Props> = ({
             }
             else if (detail.action === 'MINIMAP_ACTION') {
                 issueCommand('MINIMAP_ACTION', { unitIds: state.selection, x: detail.x, y: detail.y });
+            }
+            else if (detail.action === 'BUILD') {
+                issueCommand('BUILD', {
+                    workerId: detail.workerId,
+                    type: detail.type,
+                    x: detail.x,
+                    y: detail.y,
+                    entityId: detail.entityId
+                });
+            }
+            else if (detail.action === 'RIGHT_CLICK') {
+                issueCommand('RIGHT_CLICK', {
+                    unitIds: detail.unitIds,
+                    x: detail.x,
+                    y: detail.y,
+                    targetId: detail.targetId
+                });
+            }
+            else if (detail.action === 'STOP') {
+                issueCommand('STOP', { unitIds: detail.unitIds });
+            }
+            else if (detail.action === 'SELECT') {
+                state.selection = detail.unitIds;
+                onSelectionChange(detail.unitIds.map((id: string) => state.entities.get(id)!).filter(Boolean));
             }
             else if (detail.action === 'NOTIFY') {
                 playSound('error');

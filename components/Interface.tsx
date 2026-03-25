@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { GameEntity, EntityType, GameState, Owner, Difficulty } from '../types';
 import { STATS, GAME_WIDTH, GAME_HEIGHT } from '../constants';
 import { toggleMute, getMuteState } from '../services/audio';
+import { CommanderChat } from './CommanderChat';
 
 interface Props {
   gameState: GameState;
@@ -452,6 +453,11 @@ export const Interface: React.FC<Props> = ({ gameState, selectedEntities, onComm
                       <span className="text-zinc-300 text-[10px] font-bold mt-1 tracking-wider group-hover:text-white">UNLOAD</span>
                   </button>
               )}
+          </div>
+          
+          {/* Commander Mode Panel */}
+          <div className="w-80 bg-zinc-950 border-l border-white/10 flex flex-col relative flex-shrink-0">
+              <CommanderChat gameState={gameState} />
           </div>
       </div>
     </div>

@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { GameCanvas } from './components/GameCanvas';
 import { Interface } from './components/Interface';
 import { Lobby } from './components/Lobby';
+import { CommanderChat } from './components/CommanderChat';
 import { GameState, GameEntity, EntityType, Owner, Difficulty } from './types';
 import { initGame } from './services/gameLogic';
 
